@@ -990,7 +990,13 @@ struct SimpleRng {
 
 impl SimpleRng {
     fn new(seed: u64) -> Self {
-        Self { state: seed.max(1) }
+        // Nearby seeds would otherwise start out nearly identical.
+        let mixed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Self {
+            state: (mixed ^ (mixed >> 31)).max(1),
+        }
     }
 
     fn next_u32(&mut self) -> u32 {
@@ -1709,6 +1715,14 @@ mod tests {
     fn chunk_text_punctuation_keeps_abbreviations() {
         let chunks = chunk_text_punctuation("Dr. Smith arrived. He left.", 18, Some(3));
         assert_eq!(chunks, vec!["Dr. Smith arrived.", "He left."]);
+    }
+
+    #[test]
+    fn nearby_seeds_give_unrelated_draws() {
+        assert_ne!(SimpleRng::new(0).next_u32(), SimpleRng::new(1).next_u32());
+        let first = SimpleRng::new(1000).next_f32();
+        let second = SimpleRng::new(1001).next_f32();
+        assert!((first - second).abs() > 1e-3, "{first} and {second}");
     }
 
     #[test]

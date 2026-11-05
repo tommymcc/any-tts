@@ -140,10 +140,13 @@ impl OmniVoiceBackbone {
             device,
             dtype,
         )?;
-        let codebook_layer_offsets = vb
-            .get(config.num_audio_codebook, "codebook_layer_offsets")?
-            .to_dtype(DType::U32)?
-            .reshape((1, config.num_audio_codebook, 1))?;
+        // Stored as integers, which can't load through a low-precision float
+        // VarBuilder: candle has no CUDA conversion from BF16 back to U32.
+        let offsets: Vec<u32> = (0..config.num_audio_codebook)
+            .map(|layer| (layer * config.audio_vocab_size) as u32)
+            .collect();
+        let codebook_layer_offsets =
+            Tensor::from_vec(offsets, (1, config.num_audio_codebook, 1), device)?;
 
         Ok(Self {
             config: config.clone(),
@@ -267,14 +270,10 @@ impl TtsModel for OmniVoiceModel {
         } else {
             compute_device.clone()
         };
-        let audio_dtype = if matches!(audio_device, Device::Cpu) {
-            DType::F32
-        } else {
-            compute_dtype
-        };
+        // The Python package runs the codec in F32 whatever the backbone uses.
         let audio_vb = ModelFiles::load_safetensors_vb(
             &files.speech_tokenizer_weights,
-            audio_dtype,
+            DType::F32,
             &audio_device,
         )?;
         let audio_tokenizer = OmniVoiceAudioTokenizerDecoder::load(

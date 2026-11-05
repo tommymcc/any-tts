@@ -312,10 +312,11 @@ impl TtsModel for OmniVoiceModel {
     }
 
     fn synthesize(&self, request: &SynthesisRequest) -> Result<AudioSamples, TtsError> {
-        if request.speed.is_some() {
-            return Err(TtsError::ModelError(
-                "OmniVoice does not support explicit speaking speed".into(),
-            ));
+        let speed = request.speed.unwrap_or(1.0);
+        if !speed.is_finite() || speed <= 0.0 {
+            return Err(TtsError::ModelError(format!(
+                "OmniVoice speaking speed must be above zero, not {speed}"
+            )));
         }
         if request.max_tokens == Some(0)
             || request.temperature.is_some_and(|v| !v.is_finite())
@@ -346,7 +347,7 @@ impl TtsModel for OmniVoiceModel {
         let normalized_language = self.normalize_language(request.language.as_deref());
         let normalized_instruct = normalize_instruct(request.instruct.as_deref(), &request.text);
         let target_len = request.max_tokens.unwrap_or_else(|| {
-            estimate_target_tokens_with_reference(&request.text, None, None, 1.0)
+            estimate_target_tokens_with_reference(&request.text, None, None, speed)
         });
         let token_chunks = self.generate_token_chunks(
             &request.text,
@@ -354,6 +355,7 @@ impl TtsModel for OmniVoiceModel {
             normalized_language.as_deref(),
             normalized_instruct.as_deref(),
             &gen_config,
+            speed,
         )?;
         let mut samples = self.decode_token_chunks(&token_chunks)?;
         post_process_audio(&mut samples, self.sample_rate());
@@ -458,6 +460,7 @@ impl OmniVoiceModel {
         language: Option<&str>,
         instruct: Option<&str>,
         gen_config: &OmniVoiceGenerationConfig,
+        speed: f64,
     ) -> Result<Vec<GeneratedAudioTokens>, TtsError> {
         let chunk_threshold =
             (gen_config.audio_chunk_threshold.max(0.0) * self.frame_rate as f32).round() as usize;
@@ -488,7 +491,7 @@ impl OmniVoiceModel {
             target_len
         );
 
-        let first_target_len = estimate_target_tokens_with_reference(&chunks[0], None, None, 1.0);
+        let first_target_len = estimate_target_tokens_with_reference(&chunks[0], None, None, speed);
         let first_chunk = self.generate_audio_tokens(
             &chunks[0],
             first_target_len,
@@ -507,7 +510,7 @@ impl OmniVoiceModel {
                 chunk,
                 Some(&chunks[0]),
                 Some(first_chunk.len),
-                1.0,
+                speed,
             );
             generated.push(self.generate_audio_tokens(
                 chunk,
@@ -1592,6 +1595,18 @@ fn index_2d(row: usize, col: usize, cols: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_divides_the_estimated_length() {
+        // The reference's own text takes the reference's own length at normal speed.
+        let text = "A sentence long enough that the short-text boost does not apply to it.";
+        let estimate =
+            |speed| estimate_target_tokens_with_reference(text, Some(text), Some(200), speed);
+        assert_eq!(estimate(1.0), 200);
+        assert_eq!(estimate(2.0), 100);
+        assert_eq!(estimate(0.5), 400);
+        assert_eq!(estimate(1.6), 125);
+    }
 
     #[test]
     fn unguided_scoring_needs_no_unconditional_pass() -> Result<(), TtsError> {

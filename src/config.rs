@@ -1260,11 +1260,12 @@ pub fn preferred_runtime_choice(model_type: ModelType) -> RuntimeChoice {
 
 fn preferred_dtype_for(model_type: ModelType, device: DeviceSelection) -> DType {
     match model_type {
+        // The Python package's CLI uses F16, and BF16 strays further from F32.
         ModelType::OmniVoice => match device {
             DeviceSelection::Cpu => DType::F32,
-            DeviceSelection::Cuda(_) => DType::BF16,
+            DeviceSelection::Cuda(_) => DType::F16,
             DeviceSelection::Metal(_) => DType::F32,
-            DeviceSelection::Auto => DType::BF16,
+            DeviceSelection::Auto => DType::F16,
         },
         ModelType::Kokoro => match device {
             DeviceSelection::Cpu => DType::F32,
@@ -1781,6 +1782,14 @@ mod tests {
         assert_eq!(
             preferred_dtype_for(ModelType::Kokoro, DeviceSelection::Metal(0)),
             DType::F32
+        );
+    }
+
+    #[test]
+    fn test_omnivoice_cuda_prefers_f16() {
+        assert_eq!(
+            preferred_dtype_for(ModelType::OmniVoice, DeviceSelection::Cuda(0)),
+            DType::F16
         );
     }
 

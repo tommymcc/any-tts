@@ -870,7 +870,7 @@ fn retain_best(candidates: &mut Vec<(f32, usize)>, count: usize) {
 }
 
 fn build_schedule(total_masked: usize, num_steps: usize, t_shift: f64) -> Vec<usize> {
-    let timesteps = get_time_steps(num_steps + 1, t_shift);
+    let timesteps = get_time_steps(num_steps, t_shift);
     let mut remaining = total_masked;
     let mut schedule = Vec::with_capacity(num_steps);
     for step in 0..num_steps {
@@ -887,13 +887,22 @@ fn build_schedule(total_masked: usize, num_steps: usize, t_shift: f64) -> Vec<us
     schedule
 }
 
+/// Evenly spaced times, warped towards the start. Calculated in F32 as the
+/// Python package does, since rounding here moves tokens between steps.
 fn get_time_steps(num_step: usize, t_shift: f64) -> Vec<f64> {
-    let mut timesteps = Vec::with_capacity(num_step + 1);
-    for index in 0..=num_step {
-        let t = index as f64 / num_step.max(1) as f64;
-        timesteps.push(t_shift * t / (1.0 + (t_shift - 1.0) * t));
-    }
-    timesteps
+    let step = 1.0f32 / num_step.max(1) as f32;
+    let shift = t_shift as f32;
+    let shift_minus_one = (t_shift - 1.0) as f32;
+    (0..=num_step)
+        .map(|index| {
+            let t = if index < num_step.div_ceil(2) {
+                step * index as f32
+            } else {
+                1.0 - step * (num_step - index) as f32
+            };
+            f64::from(shift * t / (1.0 + shift_minus_one * t))
+        })
+        .collect()
 }
 
 fn build_causal_attention_mask(
@@ -1533,6 +1542,27 @@ mod tests {
         );
         assert!(guided_log_probs(&conditional, None, 2.).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn schedule_matches_the_python_package() {
+        // Values from omnivoice.models.omnivoice with num_step=32 and t_shift=0.1.
+        let short: Vec<usize> = vec![
+            3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 6, 6, 7, 8, 8, 9, 11, 12, 14, 16, 18, 22, 26,
+            32, 41, 53, 72, 103, 143,
+        ];
+        let long: Vec<usize> = vec![
+            8, 9, 9, 10, 10, 11, 12, 13, 13, 14, 16, 17, 18, 20, 22, 24, 27, 30, 33, 37, 42, 49,
+            56, 66, 78, 95, 116, 147, 192, 261, 375, 570,
+        ];
+        assert_eq!(
+            build_schedule(82 * 8, DEFAULT_NUM_STEPS, DEFAULT_T_SHIFT),
+            short
+        );
+        assert_eq!(
+            build_schedule(300 * 8, DEFAULT_NUM_STEPS, DEFAULT_T_SHIFT),
+            long
+        );
     }
 
     #[test]

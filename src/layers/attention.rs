@@ -212,19 +212,32 @@ impl GroupedQueryAttention {
             } else {
                 // Repeat KV heads to match Q heads (GQA expansion)
                 // Use repeat_interleave semantics: [h0,h0,h1,h1,...] not repeat: [h0..h7,h0..h7]
-                // so that Q head i pairs with KV head i/repeat_factor.
+                // so that Q head i pairs with KV head i/repeat_factor. Broadcasting costs one
+                // strided copy on CUDA, where `repeat` costs a transpose and cat per dimension.
                 let repeat_factor = self.num_heads / self.num_kv_heads;
                 let kv_len = k.dim(2)?;
                 let k = if repeat_factor > 1 {
                     k.unsqueeze(2)?
-                        .repeat(&[1, 1, repeat_factor, 1, 1])?
+                        .broadcast_as((
+                            batch,
+                            self.num_kv_heads,
+                            repeat_factor,
+                            kv_len,
+                            self.head_dim,
+                        ))?
                         .reshape((batch, self.num_heads, kv_len, self.head_dim))?
                 } else {
                     k
                 };
                 let v = if repeat_factor > 1 {
                     v.unsqueeze(2)?
-                        .repeat(&[1, 1, repeat_factor, 1, 1])?
+                        .broadcast_as((
+                            batch,
+                            self.num_kv_heads,
+                            repeat_factor,
+                            kv_len,
+                            self.head_dim,
+                        ))?
                         .reshape((batch, self.num_heads, kv_len, self.head_dim))?
                 } else {
                     v

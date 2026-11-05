@@ -5,7 +5,7 @@ use crate::layers::conv::{Conv1d, ConvTranspose1d};
 
 use super::config::OmniVoiceAudioTokenizerConfig;
 
-fn snake1d(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
+pub(super) fn snake1d(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
     let sin_sq = alpha.broadcast_mul(x)?.sin()?.sqr()?;
     let inv_alpha = (alpha + 1e-9)?.recip()?;
     x.add(&sin_sq.broadcast_mul(&inv_alpha)?)
@@ -88,7 +88,7 @@ impl OmniVoiceResidualVectorQuantizer {
     }
 }
 
-struct DacResidualUnit {
+pub(super) struct DacResidualUnit {
     snake1_alpha: Tensor,
     conv1: Conv1d,
     snake2_alpha: Tensor,
@@ -96,7 +96,7 @@ struct DacResidualUnit {
 }
 
 impl DacResidualUnit {
-    fn load(channels: usize, dilation: usize, vb: VarBuilder) -> Result<Self> {
+    pub(super) fn load(channels: usize, dilation: usize, vb: VarBuilder) -> Result<Self> {
         let pad = 3 * dilation;
         let snake1_alpha = vb.pp("snake1").get((1, channels, 1), "alpha")?;
         let conv1 = Conv1d::load(
@@ -120,7 +120,7 @@ impl DacResidualUnit {
         })
     }
 
-    fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
         let h = self.conv1.forward(&snake1d(hidden, &self.snake1_alpha)?)?;
         let h = self.conv2.forward(&snake1d(&h, &self.snake2_alpha)?)?;
         trim_residual_input(hidden, &h)?.add(&h)

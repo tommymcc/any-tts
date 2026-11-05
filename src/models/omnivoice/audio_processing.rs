@@ -1,5 +1,7 @@
-//! Waveform processing that matches the Python OmniVoice package, which uses
-//! pydub for silence handling.
+//! Waveform processing that matches the upstream OmniVoice package, which uses
+//! pydub for silence handling and torchaudio for resampling.
+
+use std::f64::consts::PI;
 
 const FRAME_MS: usize = 10;
 const SILENCE_DB: f64 = -50.0;
@@ -209,6 +211,106 @@ pub fn remove_silence(
     to_f32(&trim_edges(split, sample_rate, lead_ms, trail_ms))
 }
 
+/// Shortens audio over `trim_threshold` seconds to at most `max_seconds`,
+/// ending at the start of a phrase so no word is cut. Audio with no usable
+/// pause is cut at `max_seconds`.
+pub fn trim_long_audio(
+    samples: &[f32],
+    sample_rate: u32,
+    max_seconds: f32,
+    min_seconds: f32,
+    trim_threshold: f32,
+) -> Vec<f32> {
+    if samples.len() as f32 / sample_rate as f32 <= trim_threshold {
+        return samples.to_vec();
+    }
+    let pcm = to_i16(samples);
+    let segment = Segment {
+        samples: &pcm,
+        sample_rate: sample_rate as usize,
+    };
+    let nonsilent = detect_nonsilent(&segment, 100, -40.0, FRAME_MS);
+    if nonsilent.is_empty() {
+        return samples.to_vec();
+    }
+    let max_ms = (max_seconds * 1000.0) as usize;
+    let min_ms = (min_seconds * 1000.0) as usize;
+    let mut split = 0;
+    for &(start, end) in &nonsilent {
+        if start > split && start <= max_ms {
+            split = start;
+        }
+        if end > max_ms {
+            break;
+        }
+    }
+    if split < min_ms {
+        split = max_ms.min(segment.len_ms());
+    }
+    to_f32(&segment.cut(0, split))
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// Resamples with torchaudio's default Hann-windowed sinc filter.
+pub fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    const FILTER_WIDTH: f64 = 6.0;
+    const ROLLOFF: f64 = 0.99;
+    if from_rate == to_rate {
+        return samples.to_vec();
+    }
+    let divisor = gcd(from_rate as usize, to_rate as usize);
+    let (from, to) = (from_rate as usize / divisor, to_rate as usize / divisor);
+    let base = from.min(to) as f64 * ROLLOFF;
+    let width = (FILTER_WIDTH * from as f64 / base).ceil() as usize;
+    let taps = 2 * width + from;
+
+    let kernels: Vec<Vec<f32>> = (0..to)
+        .map(|phase| {
+            let offset = f64::from(-(phase as f32) / to as f32);
+            (0..taps)
+                .map(|tap| {
+                    let index = (tap as f64 - width as f64) / from as f64;
+                    let t = ((offset + index) * base).clamp(-FILTER_WIDTH, FILTER_WIDTH);
+                    let window = (t * PI / FILTER_WIDTH / 2.0).cos().powi(2);
+                    let radians = t * PI;
+                    let sinc = if radians == 0.0 {
+                        1.0
+                    } else {
+                        radians.sin() / radians
+                    };
+                    (sinc * (window * base / from as f64)) as f32
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut padded = vec![0.0f32; width];
+    padded.extend_from_slice(samples);
+    padded.resize(padded.len() + width + from, 0.0);
+    let target = (to as f64 * samples.len() as f64 / from as f64).ceil() as usize;
+    let mut out = Vec::with_capacity(target);
+    for window in padded.windows(taps).step_by(from) {
+        for kernel in &kernels {
+            out.push(
+                window
+                    .iter()
+                    .zip(kernel)
+                    .map(|(sample, tap)| sample * tap)
+                    .sum(),
+            );
+        }
+    }
+    out.truncate(target);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +337,37 @@ mod tests {
     #[test]
     fn all_silence_empties() {
         assert!(remove_silence(&tone(1000, 0.0), 24_000, 200, 100, 200).is_empty());
+    }
+
+    #[test]
+    fn short_audio_is_not_trimmed() {
+        let audio = tone(1000, 0.5);
+        assert_eq!(
+            trim_long_audio(&audio, 24_000, 15.0, 3.0, 20.0).len(),
+            audio.len()
+        );
+    }
+
+    #[test]
+    fn long_audio_trims_at_a_pause() {
+        let mut audio = Vec::new();
+        for _ in 0..5 {
+            audio.extend(tone(5000, 0.5));
+            audio.extend(tone(300, 0.0));
+        }
+        let out = trim_long_audio(&audio, 24_000, 15.0, 3.0, 20.0);
+        let seconds = out.len() as f32 / 24_000.0;
+        assert!((seconds - 10.6).abs() < 0.05, "{seconds}");
+    }
+
+    #[test]
+    fn resampling_keeps_a_low_tone_and_the_expected_length() {
+        let audio = tone(1000, 0.5);
+        let out = resample(&audio, 24_000, 16_000);
+        assert_eq!(out.len(), 16_000);
+        let peak = out[1000..15000]
+            .iter()
+            .fold(0f32, |peak, sample| peak.max(sample.abs()));
+        assert!((peak - 0.5).abs() < 0.01, "{peak}");
     }
 }

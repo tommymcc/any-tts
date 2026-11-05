@@ -7,11 +7,13 @@ use crate::config::{
 use crate::device::DeviceSelection;
 use crate::models::ModelType;
 
+mod audio_encoder;
 mod audio_processing;
 mod audio_tokenizer;
 mod config;
 pub mod model;
 
+pub use audio_processing::trim_long_audio;
 pub use model::OmniVoiceModel;
 
 /// Recommended runtime choice for native OmniVoice on the current binary.

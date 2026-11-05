@@ -62,7 +62,15 @@ pub struct OmniVoiceAudioTokenizerConfig {
     pub sample_rate: u32,
     pub codebook_size: usize,
     pub codebook_dim: usize,
+    pub downsample_factor: usize,
+    pub semantic_sample_rate: u32,
+    pub kernel_size: usize,
+    pub unit_kernel_size: usize,
+    pub strides: Vec<usize>,
+    pub channel_ratios: Vec<usize>,
+    pub block_dilations: Vec<usize>,
     pub acoustic_model_config: OmniVoiceDacConfig,
+    pub semantic_model_config: OmniVoiceSemanticConfig,
 }
 
 impl OmniVoiceAudioTokenizerConfig {
@@ -77,6 +85,18 @@ impl OmniVoiceAudioTokenizerConfig {
             .product()
     }
 
+    /// Size of the joined acoustic and semantic features.
+    pub fn semantic_hidden_size(&self) -> usize {
+        self.acoustic_model_config.hidden_size + self.semantic_model_config.hidden_size
+    }
+
+    /// How many semantic frames make one codec frame.
+    pub fn semantic_downsample_factor(&self) -> usize {
+        let hop = self.hop_length() as f64;
+        let ratio = f64::from(self.sample_rate) / f64::from(self.semantic_sample_rate);
+        ((hop / ratio / self.downsample_factor as f64) as usize).max(1)
+    }
+
     pub fn frame_rate(&self) -> usize {
         let hop_length = self.hop_length();
         (self.sample_rate as usize + hop_length.saturating_sub(1)) / hop_length.max(1)
@@ -87,5 +107,21 @@ impl OmniVoiceAudioTokenizerConfig {
 pub struct OmniVoiceDacConfig {
     pub hidden_size: usize,
     pub decoder_hidden_size: usize,
+    pub encoder_hidden_size: usize,
+    pub downsampling_ratios: Vec<usize>,
     pub upsampling_ratios: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OmniVoiceSemanticConfig {
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_attention_heads: usize,
+    pub num_hidden_layers: usize,
+    pub num_conv_pos_embeddings: usize,
+    pub num_conv_pos_embedding_groups: usize,
+    pub layer_norm_eps: f64,
+    pub conv_dim: Vec<usize>,
+    pub conv_kernel: Vec<usize>,
+    pub conv_stride: Vec<usize>,
 }

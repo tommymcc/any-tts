@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Linear, Module};
 use tracing::info;
+use unicode_general_category::{get_general_category, GeneralCategory};
 
 use crate::audio::AudioSamples;
 use crate::config::{ModelFiles, TtsConfig};
@@ -344,9 +345,9 @@ impl TtsModel for OmniVoiceModel {
         let gen_config = OmniVoiceGenerationConfig::from_request(request);
         let normalized_language = self.normalize_language(request.language.as_deref());
         let normalized_instruct = normalize_instruct(request.instruct.as_deref(), &request.text);
-        let target_len = request
-            .max_tokens
-            .unwrap_or_else(|| estimate_target_tokens(&request.text, self.frame_rate));
+        let target_len = request.max_tokens.unwrap_or_else(|| {
+            estimate_target_tokens_with_reference(&request.text, None, None, 1.0)
+        });
         let token_chunks = self.generate_token_chunks(
             &request.text,
             target_len,
@@ -487,7 +488,7 @@ impl OmniVoiceModel {
             target_len
         );
 
-        let first_target_len = estimate_target_tokens(&chunks[0], self.frame_rate);
+        let first_target_len = estimate_target_tokens_with_reference(&chunks[0], None, None, 1.0);
         let first_chunk = self.generate_audio_tokens(
             &chunks[0],
             first_target_len,
@@ -1147,61 +1148,130 @@ fn top_k_summary(values: &[f32], count: usize) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn estimate_target_tokens(text: &str, frame_rate: usize) -> usize {
-    estimate_target_tokens_with_reference(
-        text,
-        Some("Nice to meet you."),
-        Some(frame_rate.max(1)),
-        1.0,
-    )
-}
-
 fn estimate_target_tokens_with_reference(
     text: &str,
     ref_text: Option<&str>,
     ref_audio_tokens: Option<usize>,
-    speed: f32,
+    speed: f64,
 ) -> usize {
-    let ref_text = ref_text
-        .filter(|text| !text.is_empty())
-        .unwrap_or("Nice to meet you.");
-    let ref_tokens = ref_audio_tokens.unwrap_or(25).max(1) as f32;
-    let ref_weight = text_weight(ref_text).max(1.0);
-    let target_weight = text_weight(text).max(1.0);
-    let mut estimate = target_weight / (ref_weight / ref_tokens);
-    if estimate < 50.0 {
-        estimate = 50.0 * (estimate / 50.0).powf(1.0 / 3.0);
+    const LOW_THRESHOLD: f64 = 50.0;
+    const BOOST_STRENGTH: f64 = 3.0;
+    let (ref_text, ref_tokens) = match (ref_text, ref_audio_tokens) {
+        (Some(text), Some(tokens)) if !text.is_empty() => (text, tokens),
+        _ => ("Nice to meet you.", 25),
+    };
+    let ref_weight = text_weight(ref_text);
+    if ref_tokens == 0 || ref_weight == 0.0 {
+        return 1;
     }
-    if speed > 0.0 && speed != 1.0 {
+    let mut estimate = text_weight(text) / (ref_weight / ref_tokens as f64);
+    if estimate < LOW_THRESHOLD {
+        estimate = LOW_THRESHOLD * (estimate / LOW_THRESHOLD).powf(1.0 / BOOST_STRENGTH);
+    }
+    if speed != 1.0 {
         estimate /= speed;
     }
-    estimate.max(1.0).round() as usize
+    (estimate as usize).max(1)
 }
 
-fn text_weight(text: &str) -> f32 {
+fn text_weight(text: &str) -> f64 {
     text.chars().map(char_weight).sum()
 }
 
-fn char_weight(ch: char) -> f32 {
-    if ch.is_ascii_whitespace() {
-        return 0.2;
-    }
-    if ch.is_ascii_punctuation() || (ch.is_ascii_graphic() && !ch.is_alphanumeric()) {
-        return 0.5;
-    }
-    if ch.is_ascii_digit() || ch.is_numeric() {
-        return 3.5;
-    }
+/// Relative speaking time of a character, where a Latin letter is 1.0.
+fn char_weight(ch: char) -> f64 {
+    const CJK: f64 = 3.0;
+    const HANGUL: f64 = 2.5;
+    const KANA: f64 = 2.2;
+    const SYLLABIC: f64 = 3.0;
+    const INDIC: f64 = 1.8;
+    const THAI_LAO: f64 = 1.5;
+    const KHMER_MYANMAR: f64 = 1.8;
+    const ABJAD: f64 = 1.5;
+    const ALPHABET: f64 = 1.0;
+    const PUNCTUATION: f64 = 0.5;
+    const SPACE: f64 = 0.2;
+    const DIGIT: f64 = 3.5;
+    const MARK: f64 = 0.0;
+    // Each entry covers code points up to its limit, above the previous entry.
+    const RANGES: &[(u32, f64)] = &[
+        (0x058F, ALPHABET),
+        (0x08FF, ABJAD),
+        (0x0DFF, INDIC),
+        (0x0EFF, THAI_LAO),
+        (0x0FFF, INDIC),
+        (0x109F, KHMER_MYANMAR),
+        (0x10FF, ALPHABET),
+        (0x11FF, HANGUL),
+        (0x139F, SYLLABIC),
+        (0x177F, ALPHABET),
+        (0x17FF, KHMER_MYANMAR),
+        (0x18FF, ALPHABET),
+        (0x19DF, INDIC),
+        (0x19FF, KHMER_MYANMAR),
+        (0x1C7F, INDIC),
+        (0x1CBF, ALPHABET),
+        (0x1CFF, INDIC),
+        (0x1EFF, ALPHABET),
+        (0x30FF, KANA),
+        (0x312F, CJK),
+        (0x318F, HANGUL),
+        (0x9FFF, CJK),
+        (0xA4CF, SYLLABIC),
+        (0xA7FF, ALPHABET),
+        (0xA82F, INDIC),
+        (0xA87F, ALPHABET),
+        (0xA95F, INDIC),
+        (0xA97F, HANGUL),
+        (0xA9DF, INDIC),
+        (0xA9FF, KHMER_MYANMAR),
+        (0xAA5F, INDIC),
+        (0xAA7F, KHMER_MYANMAR),
+        (0xAAFF, INDIC),
+        (0xAB2F, SYLLABIC),
+        (0xABBF, ALPHABET),
+        (0xABFF, INDIC),
+        (0xD7AF, HANGUL),
+        (0xFAFF, CJK),
+        (0xFDFF, ABJAD),
+        (0xFE6F, ALPHABET),
+        (0xFEFF, ABJAD),
+        (0xFFEF, ALPHABET),
+    ];
+    use GeneralCategory as Category;
     let code = ch as u32;
-    match code {
-        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF => 0.0,
-        0x3040..=0x30FF => 2.2,
-        0x3400..=0x9FFF | 0xF900..=0xFAFF => 3.0,
-        0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F => 2.5,
-        0x0590..=0x08FF => 1.5,
-        0x0900..=0x0DFF | 0x1900..=0x1CFF | 0xA800..=0xABFF => 1.8,
-        0x0E00..=0x0EFF => 1.5,
-        _ => 1.0,
+    if ch.is_ascii_alphabetic() {
+        return ALPHABET;
+    }
+    if code == 0x20 {
+        return SPACE;
+    }
+    if code == 0x0640 {
+        return MARK;
+    }
+    match get_general_category(ch) {
+        Category::NonspacingMark | Category::SpacingMark | Category::EnclosingMark => MARK,
+        Category::ConnectorPunctuation
+        | Category::DashPunctuation
+        | Category::OpenPunctuation
+        | Category::ClosePunctuation
+        | Category::InitialPunctuation
+        | Category::FinalPunctuation
+        | Category::OtherPunctuation
+        | Category::MathSymbol
+        | Category::CurrencySymbol
+        | Category::ModifierSymbol
+        | Category::OtherSymbol => PUNCTUATION,
+        Category::SpaceSeparator | Category::LineSeparator | Category::ParagraphSeparator => SPACE,
+        Category::DecimalNumber | Category::LetterNumber | Category::OtherNumber => DIGIT,
+        _ => {
+            let index = RANGES.partition_point(|(limit, _)| *limit < code);
+            match RANGES.get(index) {
+                Some((_, weight)) => *weight,
+                None if code > 0x20000 => CJK,
+                None => ALPHABET,
+            }
+        }
     }
 }
 
@@ -1542,6 +1612,44 @@ mod tests {
         assert_eq!(candidates, vec![(5., 1), (5., 8), (3., 9)]);
         retain_best(&mut candidates, 0);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn length_estimate_matches_the_python_package() {
+        // Values from OmniVoice._estimate_target_tokens with its default reference.
+        for (text, expected) in [
+            ("Hi.", 22),
+            ("Hello world, this is a test of the estimate.", 64),
+            ("今天天气很好。", 43),
+            ("Ünïcode — “quoted” 1865!", 52),
+        ] {
+            let actual = estimate_target_tokens_with_reference(text, None, None, 1.0);
+            assert_eq!(actual, expected, "estimate for {text}");
+        }
+        // Values from RuleDurationEstimator.calculate_total_weight.
+        for (ch, expected) in [
+            ('a', 1.0),
+            (' ', 0.2),
+            ('\u{a0}', 0.2),
+            ('.', 0.5),
+            ('—', 0.5),
+            ('€', 0.5),
+            ('1', 3.5),
+            ('Ⅷ', 3.5),
+            ('\u{301}', 0.0),
+            ('今', 3.0),
+            ('あ', 2.2),
+            ('한', 2.5),
+            ('ب', 1.5),
+            ('क', 1.8),
+            ('ก', 1.5),
+        ] {
+            let weight = f64::from(char_weight(ch));
+            assert!(
+                (weight - expected).abs() < 1e-6,
+                "weight of {ch:?}: {weight}"
+            );
+        }
     }
 
     #[test]

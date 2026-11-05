@@ -69,6 +69,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tracing",
+ "unicode-general-category",
  "unicode-normalization",
  "zip",
 ]
@@ -3568,6 +3569,12 @@ name = "unicode-blocks"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b12e05d9e06373163a9bb6bb8c263c261b396643a99445fe6b9811fd376581b"
+
+[[package]]
+name = "unicode-general-category"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
 
 [[package]]
 name = "unicode-ident"

@@ -77,7 +77,7 @@ metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 qwen3-tts = []
 kokoro = ["dep:kana2phone", "dep:lindera", "dep:pinyin", "dep:fancy-regex", "dep:unicode-normalization"]
-omnivoice = []
+omnivoice = ["dep:unicode-general-category"]
 vibevoice = []
 voxtral = []
 download = ["dep:reqwest"]
@@ -85,6 +85,7 @@ download = ["dep:reqwest"]
 [dependencies]
 fancy-regex = { version = "0.17", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
+unicode-general-category = { version = "1", optional = true }
 base64 = "0.22"
 candle-core = "0.10.2"
 candle-nn = "0.10.2"

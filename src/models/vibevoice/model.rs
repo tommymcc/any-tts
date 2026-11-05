@@ -412,7 +412,11 @@ impl VibeVoiceModel {
         let mut scheduler = self.noise_scheduler.lock().map_err(|_| {
             TtsError::RuntimeError("VibeVoice scheduler mutex poisoned".to_string())
         })?;
-        scheduler.set_timesteps(self.config.diffusion_head_config.ddpm_num_inference_steps);
+        let steps = std::env::var("VIBEVOICE_DIFFUSION_STEPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(self.config.diffusion_head_config.ddpm_num_inference_steps);
+        scheduler.set_timesteps(steps);
 
         let condition = Tensor::cat(&[positive_condition, negative_condition], 0)?;
         let mut speech = self.initial_diffusion_speech(diffusion_noise_cursor, rng)?;

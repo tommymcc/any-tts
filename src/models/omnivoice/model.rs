@@ -1503,7 +1503,7 @@ fn post_process_audio(samples: &mut Vec<f32>, sample_rate: u32) {
     for index in 0..fade {
         let weight = linspace_weight(0.0, 1.0, index, fade);
         samples[index] *= weight;
-        let tail = samples.len() - 1 - index;
+        let tail = samples.len() - fade + index;
         samples[tail] *= linspace_weight(1.0, 0.0, index, fade);
     }
 
@@ -1551,6 +1551,18 @@ mod tests {
             "Reference. Helloworld again"
         );
         assert_eq!(combine_text("你 好 （test）", None), "你好(test)");
+    }
+
+    #[test]
+    fn post_processing_fades_out_to_silence() {
+        let mut out = vec![1.0f32; 24_000];
+        post_process_audio(&mut out, 24_000);
+        let (pad, fade) = (2400, 2400);
+        assert_eq!(out.len(), 24_000 + 2 * pad);
+        assert_eq!(out[pad], 0.0);
+        // The fade-out starts at full level and ends at silence.
+        assert!((out[pad + 24_000 - fade] - 0.5).abs() < 1e-3);
+        assert_eq!(out[pad + 24_000 - 1], 0.0);
     }
 
     #[test]

@@ -212,6 +212,8 @@ pub struct ReferenceAudio {
     pub samples: Vec<f32>,
     /// Sample rate of the audio in Hz.
     pub sample_rate: u32,
+    /// What is said in the audio. OmniVoice needs this to clone a voice.
+    pub transcript: Option<String>,
 }
 
 impl ReferenceAudio {
@@ -220,7 +222,14 @@ impl ReferenceAudio {
         Self {
             samples,
             sample_rate,
+            transcript: None,
         }
+    }
+
+    /// Set what is said in the audio.
+    pub fn with_transcript(mut self, transcript: impl Into<String>) -> Self {
+        self.transcript = Some(transcript.into());
+        self
     }
 
     /// Duration of the reference audio in seconds.

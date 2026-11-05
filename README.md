@@ -43,7 +43,7 @@ For Flow-like specifically: every public backend can now load from relative-path
 | Model | Status in any-tts | Default upstream | Best at | Main tradeoff | Model license |
 | --- | --- | --- | --- | --- | --- |
 | Kokoro-82M | Public, native, lightweight | `hexgrad/Kokoro-82M` | Fast local TTS with small weights | Uses an in-tree pure-Rust phonemizer compatible with Kokoro's current public language set; parity tuning is still ongoing | Apache-2.0 |
-| OmniVoice | Public, native | `k2-fsa/OmniVoice` | Huge language coverage and instruct-driven voice design | The current Rust backend does not yet expose upstream zero-shot cloning | Apache-2.0 |
+| OmniVoice | Public, native | `k2-fsa/OmniVoice` | Huge language coverage and instruct-driven voice design | Reference audio needs a transcript, as there is no automatic transcription | Apache-2.0 |
 | Qwen3-TTS-12Hz-1.7B | Public, native | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | Strong multilingual control, named speakers, and instruct handling | Heavy weights and extra speech-tokenizer assets | Apache-2.0 |
 | VibeVoice-1.5B | Public, native | `microsoft/VibeVoice-1.5B` | Long-form multi-speaker speech diffusion with native Rust inference | Still early and currently optimized for single-request parity work rather than streaming performance | MIT |
 | VibeVoice-Realtime-0.5B | Public, native | `microsoft/VibeVoice-Realtime-0.5B` | Low-latency preset-voice TTS with native Rust inference | English-first upstream and depends on cached `voices/*.pt` presets instead of reference audio | MIT |
@@ -243,7 +243,7 @@ Using these exact relative paths makes the byte-based API foolproof because the 
 | `temperature` | Sampling temperature | Supported where the backend uses it. |
 | `speed` | Speaking-rate multiplier | Kokoro: finite values from `0.1` through `5.0`, default `1.0`. OmniVoice: any finite value above zero, which divides the estimated audio length, so `max_tokens` takes priority over it. |
 | `cfg_scale` | Classifier-free guidance scale | Used by OmniVoice and other backends that expose CFG-like control. |
-| `reference_audio` | Reference clip for voice cloning or prompt conditioning | Used by backends such as VibeVoice when conditioning from speech; unsupported backends return an explicit error. |
+| `reference_audio` | Reference clip for voice cloning or prompt conditioning | Used by backends such as VibeVoice when conditioning from speech. OmniVoice needs it at 24 kHz with a transcript, set by `with_transcript()`. Unsupported backends return an explicit error. |
 | `voice_embedding` | Precomputed embedding payload | Currently reusable with backends that accept embeddings directly. |
 
 Kokoro callers that previously used `with_temperature()` to change speaking
@@ -375,13 +375,14 @@ OmniVoice is the ambition play in this repo. Upstream, it is a diffusion languag
 
 - Native Candle backend.
 - `language`, `instruct`, `cfg_scale`, `max_tokens`, and `speed` request controls.
+- Voice cloning from reference audio with a transcript. `scripts/omnivoice_parity.py` and the ignored `matches_python_oracle` test compare it with the Python package.
 - Automatic runtime preference selection for CPU, CUDA, or Metal.
 - Repo-exposed language set: `auto`, `en`, `zh`, `ja`, `ko`, `de`, `fr`, `es`, `pt`, `ru`, `it`.
 
 **What does not work yet in the Rust backend**
 
 - Named voices.
-- Reference-audio voice cloning.
+- Automatic transcription of reference audio.
 - Reusable voice embeddings.
 
 The code returns explicit errors for those cases instead of silently falling back to Python.
@@ -396,7 +397,6 @@ The code returns explicit errors for those cases instead of silently falling bac
 **Cons**
 
 - The current Rust implementation exposes less than the upstream model card promises.
-- If your main requirement is zero-shot cloning from reference audio, this backend is not there yet in this crate.
 - Heavier than Kokoro and less turnkey than the small local-first path.
 
 **License**

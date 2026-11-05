@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -14,8 +14,9 @@ use crate::layers::attention::GqaConfig;
 use crate::layers::transformer::TransformerBlock;
 use crate::tensor_utils::{precompute_rope_freqs, RmsNorm};
 use crate::tokenizer::TextTokenizer;
-use crate::traits::{ModelInfo, SynthesisRequest, TtsModel};
+use crate::traits::{ModelInfo, ReferenceAudio, SynthesisRequest, TtsModel};
 
+use super::audio_encoder::OmniVoiceAudioEncoder;
 use super::audio_processing::remove_silence;
 use super::audio_tokenizer::OmniVoiceAudioTokenizerDecoder;
 use super::config::{OmniVoiceAudioTokenizerConfig, OmniVoiceConfig};
@@ -28,6 +29,8 @@ const DEFAULT_POSITION_TEMPERATURE: f32 = 5.0;
 const DEFAULT_CLASS_TEMPERATURE: f32 = 0.0;
 const DEFAULT_AUDIO_CHUNK_DURATION: f32 = 15.0;
 const DEFAULT_AUDIO_CHUNK_THRESHOLD: f32 = 30.0;
+/// References quieter than this are scaled up to it for encoding.
+const REFERENCE_MIN_RMS: f32 = 0.1;
 
 struct OmniVoiceGenerationConfig {
     num_step: usize,
@@ -79,6 +82,30 @@ struct InferenceInputs {
 struct GeneratedAudioTokens {
     tokens: Vec<u32>,
     len: usize,
+}
+
+/// A prepared voice: the reference as codec tokens, with its text and level.
+struct VoicePrompt {
+    source: ReferenceAudio,
+    tokens: GeneratedAudioTokens,
+    text: String,
+    rms: f32,
+}
+
+/// A voice prompt, or nothing when generating without a reference.
+#[derive(Clone, Copy, Default)]
+struct PromptView<'a> {
+    text: Option<&'a str>,
+    tokens: Option<&'a GeneratedAudioTokens>,
+}
+
+impl<'a> From<&'a VoicePrompt> for PromptView<'a> {
+    fn from(prompt: &'a VoicePrompt) -> Self {
+        Self {
+            text: Some(&prompt.text),
+            tokens: Some(&prompt.tokens),
+        }
+    }
 }
 
 struct OmniVoiceBackbone {
@@ -216,7 +243,9 @@ pub struct OmniVoiceModel {
     tokenizer: TextTokenizer,
     backbone: Mutex<OmniVoiceBackbone>,
     causal_mask_cache: Mutex<HashMap<usize, Tensor>>,
+    audio_tokenizer_config: OmniVoiceAudioTokenizerConfig,
     audio_tokenizer: OmniVoiceAudioTokenizerDecoder,
+    voice_prompt: Mutex<Option<Arc<VoicePrompt>>>,
     mask_token_penalty: Tensor,
 }
 
@@ -271,7 +300,7 @@ impl TtsModel for OmniVoiceModel {
         } else {
             compute_device.clone()
         };
-        // The Python package runs the codec in F32 whatever the backbone uses.
+        // Upstream runs the codec in F32 whatever the backbone uses.
         let audio_vb = ModelFiles::load_safetensors_vb(
             &files.speech_tokenizer_weights,
             DType::F32,
@@ -306,7 +335,9 @@ impl TtsModel for OmniVoiceModel {
             tokenizer,
             backbone: Mutex::new(backbone),
             causal_mask_cache: Mutex::new(HashMap::new()),
+            audio_tokenizer_config,
             audio_tokenizer,
+            voice_prompt: Mutex::new(None),
             mask_token_penalty,
         })
     }
@@ -332,11 +363,6 @@ impl TtsModel for OmniVoiceModel {
                     .to_string(),
             ));
         }
-        if request.reference_audio.is_some() {
-            return Err(TtsError::ModelError(
-                "Native OmniVoice voice cloning is not implemented yet. Reference-audio synthesis no longer falls back to Python.".to_string(),
-            ));
-        }
         if request.voice_embedding.is_some() {
             return Err(TtsError::ModelError(
                 "Native OmniVoice does not support reusable voice embeddings yet.".to_string(),
@@ -346,8 +372,19 @@ impl TtsModel for OmniVoiceModel {
         let gen_config = OmniVoiceGenerationConfig::from_request(request);
         let normalized_language = self.normalize_language(request.language.as_deref());
         let normalized_instruct = normalize_instruct(request.instruct.as_deref(), &request.text);
+        let prompt = request
+            .reference_audio
+            .as_ref()
+            .map(|reference| self.prepare_voice(reference))
+            .transpose()?;
+        let view = prompt.as_deref().map(PromptView::from).unwrap_or_default();
         let target_len = request.max_tokens.unwrap_or_else(|| {
-            estimate_target_tokens_with_reference(&request.text, None, None, speed)
+            estimate_target_tokens_with_reference(
+                &request.text,
+                view.text,
+                view.tokens.map(|t| t.len),
+                speed,
+            )
         });
         let token_chunks = self.generate_token_chunks(
             &request.text,
@@ -355,10 +392,15 @@ impl TtsModel for OmniVoiceModel {
             normalized_language.as_deref(),
             normalized_instruct.as_deref(),
             &gen_config,
+            view,
             speed,
         )?;
         let samples = self.decode_token_chunks(&token_chunks)?;
-        let samples = post_process_audio(&samples, self.sample_rate());
+        let samples = post_process_audio(
+            &samples,
+            self.sample_rate(),
+            prompt.as_deref().map(|p| p.rms),
+        );
 
         Ok(AudioSamples::new(samples, self.sample_rate()))
     }
@@ -407,6 +449,69 @@ impl TtsModel for OmniVoiceModel {
 }
 
 impl OmniVoiceModel {
+    /// Encodes a reference, reusing the last result for the same reference,
+    /// since a book asks for the same voice thousands of times.
+    fn prepare_voice(&self, reference: &ReferenceAudio) -> Result<Arc<VoicePrompt>, TtsError> {
+        let mut cached = self.voice_prompt.lock().map_err(|_| {
+            TtsError::RuntimeError("OmniVoice voice prompt mutex was poisoned".to_string())
+        })?;
+        if let Some(prompt) = cached.as_ref() {
+            if prompt.source.samples == reference.samples
+                && prompt.source.sample_rate == reference.sample_rate
+                && prompt.source.transcript == reference.transcript
+            {
+                return Ok(prompt.clone());
+            }
+        }
+        let prompt = Arc::new(self.encode_voice(reference)?);
+        *cached = Some(prompt.clone());
+        Ok(prompt)
+    }
+
+    fn encode_voice(&self, reference: &ReferenceAudio) -> Result<VoicePrompt, TtsError> {
+        let transcript = reference
+            .transcript
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| {
+                TtsError::ConfigError(
+                    "OmniVoice needs a transcript of the reference audio".to_string(),
+                )
+            })?;
+        if reference.sample_rate != self.sample_rate() {
+            return Err(TtsError::ConfigError(format!(
+                "OmniVoice needs reference audio at {} Hz, got {} Hz",
+                self.sample_rate(),
+                reference.sample_rate
+            )));
+        }
+        let (samples, rms) = prepare_reference_samples(
+            &reference.samples,
+            self.sample_rate(),
+            self.audio_tokenizer_config.hop_length(),
+        )?;
+
+        let vb = ModelFiles::load_safetensors_vb(
+            &self.files.speech_tokenizer_weights,
+            DType::F32,
+            &self.audio_device,
+        )?;
+        let encoder = OmniVoiceAudioEncoder::load(
+            &self.audio_tokenizer_config,
+            self.config.num_audio_codebook,
+            vb,
+            &self.audio_device,
+        )?;
+        let (tokens, len) = encoder.encode(&samples)?;
+        Ok(VoicePrompt {
+            source: reference.clone(),
+            tokens: GeneratedAudioTokens { tokens, len },
+            text: add_final_punctuation(transcript),
+            rms,
+        })
+    }
+
     fn causal_attention_mask(&self, seq_len: usize) -> Result<Tensor, TtsError> {
         if let Some(mask) = self
             .causal_mask_cache
@@ -453,6 +558,7 @@ impl OmniVoiceModel {
         Some(mapped.to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_token_chunks(
         &self,
         text: &str,
@@ -460,17 +566,28 @@ impl OmniVoiceModel {
         language: Option<&str>,
         instruct: Option<&str>,
         gen_config: &OmniVoiceGenerationConfig,
+        prompt: PromptView,
         speed: f64,
     ) -> Result<Vec<GeneratedAudioTokens>, TtsError> {
         let chunk_threshold =
             (gen_config.audio_chunk_threshold.max(0.0) * self.frame_rate as f32).round() as usize;
+        let single = |prompt: PromptView| {
+            self.generate_audio_tokens(
+                text,
+                target_len,
+                language,
+                instruct,
+                gen_config,
+                prompt.text,
+                prompt.tokens,
+            )
+            .map(|tokens| vec![tokens])
+        };
         if gen_config.audio_chunk_duration <= 0.0
             || chunk_threshold == 0
             || target_len <= chunk_threshold
         {
-            return Ok(vec![self.generate_audio_tokens(
-                text, target_len, language, instruct, gen_config, None, None,
-            )?]);
+            return single(prompt);
         }
 
         let chunks = chunk_text_for_target(
@@ -480,9 +597,7 @@ impl OmniVoiceModel {
             gen_config.audio_chunk_duration,
         );
         if chunks.len() <= 1 {
-            return Ok(vec![self.generate_audio_tokens(
-                text, target_len, language, instruct, gen_config, None, None,
-            )?]);
+            return single(prompt);
         }
 
         info!(
@@ -491,25 +606,30 @@ impl OmniVoiceModel {
             target_len
         );
 
-        let first_target_len = estimate_target_tokens_with_reference(&chunks[0], None, None, speed);
-        let first_chunk = self.generate_audio_tokens(
-            &chunks[0],
-            first_target_len,
-            language,
-            instruct,
-            gen_config,
-            None,
-            None,
-        )?;
-
         let mut generated = Vec::with_capacity(chunks.len());
-        generated.push(first_chunk.clone());
-
-        for chunk in chunks.iter().skip(1) {
+        // Without a reference, the first chunk becomes the voice for the rest.
+        let first_chunk;
+        let (chunk_text, chunk_tokens, remaining) = match prompt.tokens {
+            Some(tokens) => (prompt.text, tokens, &chunks[..]),
+            None => {
+                first_chunk = self.generate_audio_tokens(
+                    &chunks[0],
+                    estimate_target_tokens_with_reference(&chunks[0], None, None, speed),
+                    language,
+                    instruct,
+                    gen_config,
+                    None,
+                    None,
+                )?;
+                generated.push(first_chunk.clone());
+                (Some(chunks[0].as_str()), &first_chunk, &chunks[1..])
+            }
+        };
+        for chunk in remaining {
             let chunk_target_len = estimate_target_tokens_with_reference(
                 chunk,
-                Some(&chunks[0]),
-                Some(first_chunk.len),
+                chunk_text,
+                Some(chunk_tokens.len),
                 speed,
             );
             generated.push(self.generate_audio_tokens(
@@ -518,8 +638,8 @@ impl OmniVoiceModel {
                 language,
                 instruct,
                 gen_config,
-                Some(&chunks[0]),
-                Some(&first_chunk),
+                chunk_text,
+                Some(chunk_tokens),
             )?);
         }
 
@@ -891,8 +1011,8 @@ fn build_schedule(total_masked: usize, num_steps: usize, t_shift: f64) -> Vec<us
     schedule
 }
 
-/// Evenly spaced times, warped towards the start. Calculated in F32 as the
-/// Python package does, since rounding here moves tokens between steps.
+/// Evenly spaced times, warped towards the start. Calculated in F32 as
+/// upstream does, since rounding here moves tokens between steps.
 fn get_time_steps(num_step: usize, t_shift: f64) -> Vec<f64> {
     let step = 1.0f32 / num_step.max(1) as f32;
     let shift = t_shift as f32;
@@ -991,7 +1111,7 @@ struct SimpleRng {
 
 impl SimpleRng {
     fn new(seed: u64) -> Self {
-        // Nearby seeds would otherwise start out nearly identical.
+        // Consecutive seeds would otherwise start out nearly identical.
         let mixed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         let mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -1578,13 +1698,24 @@ fn linspace_weight(start: f32, end: f32, index: usize, count: usize) -> f32 {
     }
 }
 
-/// Removes long pauses, sets the level, and fades and pads the edges.
-fn post_process_audio(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+/// Removes long pauses, sets the level, and fades and pads the edges. With a
+/// reference, quiet references give matching quiet output, as upstream does.
+fn post_process_audio(samples: &[f32], sample_rate: u32, ref_rms: Option<f32>) -> Vec<f32> {
     let mut samples = remove_silence(samples, sample_rate, 500, 100, 100);
-    let peak = samples.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
-    if peak > 1e-6 {
-        for sample in samples.iter_mut() {
-            *sample = *sample / peak * 0.5;
+    match ref_rms {
+        Some(rms) if rms < REFERENCE_MIN_RMS => {
+            for sample in samples.iter_mut() {
+                *sample = *sample * rms / REFERENCE_MIN_RMS;
+            }
+        }
+        Some(_) => {}
+        None => {
+            let peak = samples.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
+            if peak > 1e-6 {
+                for sample in samples.iter_mut() {
+                    *sample = *sample / peak * 0.5;
+                }
+            }
         }
     }
     if samples.is_empty() {
@@ -1604,6 +1735,48 @@ fn post_process_audio(samples: &[f32], sample_rate: u32) -> Vec<f32> {
     padded.extend(samples);
     padded.extend(std::iter::repeat_n(0.0, pad));
     padded
+}
+
+/// Scales a quiet reference up and shortens its pauses, returning the samples
+/// to encode and the original level.
+fn prepare_reference_samples(
+    samples: &[f32],
+    sample_rate: u32,
+    hop_length: usize,
+) -> Result<(Vec<f32>, f32), TtsError> {
+    let power: f64 = samples
+        .iter()
+        .map(|sample| f64::from(*sample).powi(2))
+        .sum();
+    let rms = (power / samples.len().max(1) as f64).sqrt() as f32;
+    let scaled: Vec<f32> = if rms > 0.0 && rms < REFERENCE_MIN_RMS {
+        samples
+            .iter()
+            .map(|sample| *sample * REFERENCE_MIN_RMS / rms)
+            .collect()
+    } else {
+        samples.to_vec()
+    };
+    let mut prepared = remove_silence(&scaled, sample_rate, 200, 100, 200);
+    prepared.truncate(prepared.len() / hop_length * hop_length);
+    if prepared.is_empty() {
+        return Err(TtsError::ConfigError(
+            "The reference audio is empty once silence is removed".to_string(),
+        ));
+    }
+    Ok((prepared, rms))
+}
+
+fn add_final_punctuation(text: &str) -> String {
+    let text = text.trim();
+    const ENDINGS: &str = "!\"'),.:;?]}‘’“”………、。】！），：；？";
+    match text.chars().last() {
+        Some(last) if !ENDINGS.contains(last) => {
+            let stop = if text.chars().any(is_cjk) { '。' } else { '.' };
+            format!("{text}{stop}")
+        }
+        _ => text.to_string(),
+    }
 }
 
 fn index_2d(row: usize, col: usize, cols: usize) -> usize {
@@ -1717,7 +1890,7 @@ mod tests {
 
     #[test]
     fn post_processing_fades_out_to_silence() {
-        let out = post_process_audio(&vec![1.0f32; 24_000], 24_000);
+        let out = post_process_audio(&vec![1.0f32; 24_000], 24_000, None);
         let (pad, fade) = (2400, 2400);
         assert_eq!(out.len(), 24_000 + 2 * pad);
         assert_eq!(out[pad], 0.0);
@@ -1745,5 +1918,251 @@ mod tests {
         let merged = cross_fade_chunks(&[vec![1.0; 10], vec![1.0; 10]], 30);
         assert_eq!(merged.len(), 23);
         assert_eq!(&merged[10..13], &[0.0, 0.0, 0.0]);
+    }
+
+    /// Compares every stage with values dumped by scripts/omnivoice_parity.py.
+    /// Run with OMNIVOICE_ORACLE set to the dump, and with the model downloaded.
+    #[test]
+    #[ignore = "Requires OmniVoice model weights, a GPU and an oracle dump"]
+    fn matches_python_oracle() -> Result<(), TtsError> {
+        let path = std::env::var("OMNIVOICE_ORACLE").expect("set OMNIVOICE_ORACLE");
+        let oracle = candle_core::safetensors::load(&path, &Device::Cpu)?;
+        let bytes = std::fs::read(&path).unwrap();
+        let (_, header) = safetensors::SafeTensors::read_metadata(&bytes).unwrap();
+        let meta = header.metadata().as_ref().unwrap();
+        let floats = |name: &str| oracle[name].flatten_all()?.to_vec1::<f32>();
+        let ints = |name: &str| oracle[name].flatten_all()?.to_vec1::<i32>();
+        let max_diff = |a: &[f32], b: &[f32]| {
+            assert_eq!(a.len(), b.len());
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+
+        // Stages without the model.
+        let hop = 960;
+        let loaded = floats("loaded")?;
+        let rms: f64 = meta["ref_rms"].parse().unwrap();
+        let (prepared, actual_rms) = prepare_reference_samples(&loaded, 24_000, hop)?;
+        let expected_prepared = floats("silence_removed")?;
+        println!("rms {actual_rms} vs {rms}");
+        assert!((f64::from(actual_rms) - rms).abs() < 1e-5);
+        println!(
+            "prepared {} vs {} samples, max diff {}",
+            prepared.len(),
+            expected_prepared.len(),
+            max_diff(&prepared, &expected_prepared[..prepared.len()])
+        );
+        assert_eq!(prepared.len(), expected_prepared.len() / hop * hop);
+        assert!(max_diff(&prepared, &expected_prepared[..prepared.len()]) < 1e-4);
+        let resampled = super::super::audio_processing::resample(&prepared, 24_000, 16_000);
+        let diff = max_diff(&resampled, &floats("resampled")?);
+        println!("resampled max diff {diff}");
+        assert!(diff < 1e-4);
+
+        let weights = floats("char_weights")?;
+        let mut wrong: Vec<u32> = Vec::new();
+        for code in 0..0x10000u32 {
+            if let Some(ch) = char::from_u32(code) {
+                if (char_weight(ch) as f32 - weights[code as usize]).abs() > 1e-5 {
+                    wrong.push(code);
+                }
+            }
+        }
+        println!(
+            "{} of 63488 characters weigh differently: {:x?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(20)]
+        );
+        assert!(wrong.iter().all(|code| *code >= 0x0300), "{wrong:x?}");
+
+        let schedules = ints("schedules")?;
+        for (index, t_len) in [82usize, 300, 749].iter().enumerate() {
+            let actual: Vec<i32> = build_schedule(t_len * 8, DEFAULT_NUM_STEPS, DEFAULT_T_SHIFT)
+                .into_iter()
+                .map(|count| count as i32)
+                .collect();
+            assert_eq!(
+                actual,
+                schedules[index * 32..(index + 1) * 32],
+                "schedule for {t_len}"
+            );
+        }
+
+        let ref_text = meta["ref_text"].as_str();
+        let text = meta["text"].as_str();
+        let frames = oracle["codes"].dim(2)?;
+        let estimate =
+            estimate_target_tokens_with_reference(text, Some(ref_text), Some(frames), 1.0);
+        assert_eq!(estimate.to_string(), meta["estimate"]);
+        let chunked = ints("chunked")?;
+        for (expected, text) in chunked.iter().zip([
+            "Hi.".to_string(),
+            "\u{201c}Curtsey as you\u{2019}re falling\u{2014}Do you see?\u{201d}".to_string(),
+            "It was 1865, and the Rabbit had 3 watches. ".repeat(12),
+        ]) {
+            let actual =
+                estimate_target_tokens_with_reference(&text, Some(ref_text), Some(281), 1.0);
+            assert_eq!(actual as i32, *expected, "estimate for {text}");
+        }
+
+        // Stages with the model.
+        let model = OmniVoiceModel::load(
+            TtsConfig::new(crate::models::ModelType::OmniVoice).with_preferred_runtime(),
+        )?;
+        println!("backbone dtype {:?}", model.compute_dtype);
+        let vb = ModelFiles::load_safetensors_vb(
+            &model.files.speech_tokenizer_weights,
+            DType::F32,
+            &model.audio_device,
+        )?;
+        let encoder = OmniVoiceAudioEncoder::load(
+            &model.audio_tokenizer_config,
+            model.config.num_audio_codebook,
+            vb,
+            &model.audio_device,
+        )?;
+        let features = encoder.semantic_features(&prepared)?;
+        let diff = max_diff(
+            &features.flatten_all()?.to_vec1::<f32>()?,
+            &floats("semantic_accurate")?,
+        );
+        println!("semantic features max diff {diff}");
+        assert!(diff < 1e-3);
+        let semantic = encoder.semantic_encoded(&features)?;
+        let diff = max_diff(
+            &semantic.flatten_all()?.to_vec1::<f32>()?,
+            &floats("e_semantic")?,
+        );
+        println!("semantic encoder max diff {diff}");
+        let acoustic = encoder.acoustic_features(&prepared, semantic.dim(2)?)?;
+        let diff = max_diff(
+            &acoustic.flatten_all()?.to_vec1::<f32>()?,
+            &floats("acoustic_accurate")?,
+        );
+        println!("acoustic encoder max diff {diff}");
+        assert!(diff < 1e-2);
+        let (codes, code_frames) = encoder.encode(&prepared)?;
+        drop(encoder);
+        let expected_codes = ints("codes")?;
+        assert_eq!(code_frames, frames);
+        let accurate_codes = ints("codes_accurate")?;
+        let same = codes
+            .iter()
+            .zip(&accurate_codes)
+            .filter(|(a, b)| **a as i32 == **b)
+            .count();
+        println!("reference codes: {same} of {} match", codes.len());
+        assert!(same as f32 / codes.len() as f32 > 0.99);
+
+        // From here on, use Python's codes so later stages are compared alone.
+        let ref_tokens = GeneratedAudioTokens {
+            tokens: expected_codes.iter().map(|code| *code as u32).collect(),
+            len: frames,
+        };
+        let inputs = model.prepare_inference_inputs(
+            text,
+            estimate,
+            None,
+            None,
+            true,
+            Some(ref_text),
+            Some(&ref_tokens),
+        )?;
+        let expected_ids = ints("input_ids")?;
+        let actual_ids: Vec<i32> = inputs.input_ids.iter().map(|id| *id as i32).collect();
+        assert_eq!(actual_ids, expected_ids, "input ids");
+        let expected_mask = ints("audio_mask")?;
+        let actual_mask: Vec<i32> = inputs
+            .audio_mask
+            .iter()
+            .map(|flag| i32::from(*flag))
+            .collect();
+        assert_eq!(actual_mask, expected_mask, "audio mask");
+
+        let device = &model.compute_device;
+        let (seq_len, codebooks) = (inputs.seq_len, model.config.num_audio_codebook);
+        let cond_ids =
+            Tensor::new(inputs.input_ids.as_slice(), device)?.reshape((1, codebooks, seq_len))?;
+        let mask_u32: Vec<u32> = inputs.audio_mask.iter().copied().map(u32::from).collect();
+        let mask_f32: Vec<f32> = inputs.audio_mask.iter().copied().map(f32::from).collect();
+        let cond = model.backbone.lock().unwrap().forward(
+            &cond_ids,
+            &Tensor::new(mask_u32.as_slice(), device)?.reshape((1, seq_len))?,
+            &Tensor::new(mask_f32.as_slice(), device)?.reshape((1, seq_len))?,
+            None,
+        )?;
+        let first = cond.to_dtype(DType::F32)?.i((
+            0,
+            ..,
+            seq_len - estimate..seq_len - estimate + 4,
+            ..,
+        ))?;
+        let actual = first.flatten_all()?.to_vec1::<f32>()?;
+        let expected = floats("cond_logits_0")?;
+        let diff = max_diff(&actual, &expected);
+        let mean: f32 = actual
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / actual.len() as f32;
+        println!("first conditional logits: max diff {diff}, mean diff {mean}");
+
+        let config = OmniVoiceGenerationConfig {
+            num_step: DEFAULT_NUM_STEPS,
+            guidance_scale: DEFAULT_GUIDANCE_SCALE,
+            t_shift: DEFAULT_T_SHIFT,
+            layer_penalty_factor: DEFAULT_LAYER_PENALTY,
+            position_temperature: 0.0,
+            class_temperature: DEFAULT_CLASS_TEMPERATURE,
+            denoise: true,
+            audio_chunk_duration: DEFAULT_AUDIO_CHUNK_DURATION,
+            audio_chunk_threshold: DEFAULT_AUDIO_CHUNK_THRESHOLD,
+        };
+        let started = std::time::Instant::now();
+        let generated = model.generate_audio_tokens(
+            text,
+            estimate,
+            None,
+            None,
+            &config,
+            Some(ref_text),
+            Some(&ref_tokens),
+        )?;
+        println!(
+            "generated {} frames in {:.1}s",
+            generated.len,
+            started.elapsed().as_secs_f32()
+        );
+        let expected_tokens = ints("det_tokens")?;
+        let same = generated
+            .tokens
+            .iter()
+            .zip(&expected_tokens)
+            .filter(|(a, b)| **a as i32 == **b)
+            .count();
+        println!(
+            "deterministic tokens: {same} of {} match",
+            expected_tokens.len()
+        );
+
+        let oracle_tokens = GeneratedAudioTokens {
+            tokens: expected_tokens.iter().map(|code| *code as u32).collect(),
+            len: estimate,
+        };
+        let decoded = model.decode_token_chunks(&[oracle_tokens])?;
+        let diff = max_diff(&decoded, &floats("decoded")?);
+        println!("decoded max diff {diff}");
+        assert!(diff < 1e-2);
+        let post = post_process_audio(&floats("decoded")?, 24_000, Some(rms as f32));
+        let expected_post = floats("post_processed")?;
+        println!("post-processed {} vs {}", post.len(), expected_post.len());
+        assert_eq!(post.len(), expected_post.len());
+        let diff = max_diff(&post, &expected_post);
+        println!("post-processed max diff {diff}");
+        assert!(diff < 1e-4);
+        Ok(())
     }
 }

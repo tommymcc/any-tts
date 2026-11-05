@@ -113,7 +113,7 @@ By default the crate enables `qwen3-tts`, `kokoro`, `omnivoice`, `vibevoice`, `v
 - `TtsConfig::with_preferred_runtime()` applies that runtime choice in one builder call.
 - `DType` can be set to `F32`, `F16`, or `BF16`.
 - On CPU, models that cannot safely run BF16 fall back to `F32`.
-- The native OmniVoice helper prefers `cuda:0 (bf16)`, then `metal:0 (f32)`, then `cpu (f32)`.
+- The native OmniVoice helper prefers `cuda:0 (f16)`, then `metal:0 (f32)`, then `cpu (f32)`.
 
 ## Quick start
 

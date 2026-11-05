@@ -26,11 +26,21 @@ impl RmsNorm {
     /// Apply RMS normalization.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dtype = x.dtype();
+        let shape = x.shape().clone();
         let x = x.to_dtype(candle_core::DType::F32)?;
+        // Broadcasting is cheaper at rank 2 on CUDA, where the cost of a strided element
+        // grows with rank. Nothing is copied once the input is contiguous.
+        let x = if x.rank() > 2 {
+            x.flatten_to(candle_core::D::Minus2)?
+        } else {
+            x
+        };
         let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
         let x_normed = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let result = x_normed.to_dtype(dtype)?.broadcast_mul(&self.weight)?;
-        Ok(result)
+        x_normed
+            .to_dtype(dtype)?
+            .broadcast_mul(&self.weight)?
+            .reshape(shape)
     }
 }
 
@@ -195,6 +205,28 @@ pub fn snake_beta(x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rms_norm_gives_the_same_result_at_every_rank() -> Result<()> {
+        let device = Device::Cpu;
+        let weight = Tensor::new(&[1f32, 2., 3., 4.], &device)?;
+        let norm = RmsNorm::new(weight.clone(), 1e-6);
+        for dims in [vec![4], vec![3, 4], vec![2, 3, 4], vec![2, 1, 3, 4]] {
+            let count: usize = dims.iter().product();
+            let x = Tensor::arange(1f32, count as f32 + 1., &device)?.reshape(dims.clone())?;
+            let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+            let expected = x
+                .broadcast_div(&(variance + 1e-6)?.sqrt()?)?
+                .broadcast_mul(&weight)?;
+            let actual = norm.forward(&x)?;
+            assert_eq!(actual.dims(), dims.as_slice());
+            assert_eq!(
+                actual.flatten_all()?.to_vec1::<f32>()?,
+                expected.flatten_all()?.to_vec1::<f32>()?
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn cpu_attention_accepts_strided_multi_batch_cache() -> Result<()> {

@@ -254,18 +254,26 @@ impl DpmSolverMultistepScheduler {
         let (alpha_t, sigma_t) = sigma_to_alpha_sigma_t(sigma);
         match self.prediction_type.as_str() {
             "v_prediction" => sample
-                .broadcast_mul(&Tensor::new(alpha_t as f32, sample.device())?)?
+                .broadcast_mul(
+                    &Tensor::new(alpha_t as f32, sample.device())?.to_dtype(sample.dtype())?,
+                )?
                 .broadcast_sub(
-                    &model_output
-                        .broadcast_mul(&Tensor::new(sigma_t as f32, model_output.device())?)?,
+                    &model_output.broadcast_mul(
+                        &Tensor::new(sigma_t as f32, model_output.device())?
+                            .to_dtype(model_output.dtype())?,
+                    )?,
                 ),
             "sample" => Ok(model_output.clone()),
             _ => sample
                 .broadcast_sub(
-                    &model_output
-                        .broadcast_mul(&Tensor::new(sigma_t as f32, model_output.device())?)?,
+                    &model_output.broadcast_mul(
+                        &Tensor::new(sigma_t as f32, model_output.device())?
+                            .to_dtype(model_output.dtype())?,
+                    )?,
                 )?
-                .broadcast_div(&Tensor::new(alpha_t as f32, sample.device())?),
+                .broadcast_div(
+                    &Tensor::new(alpha_t as f32, sample.device())?.to_dtype(sample.dtype())?,
+                ),
         }
     }
 
@@ -281,10 +289,10 @@ impl DpmSolverMultistepScheduler {
         let sample_scale = (sigma_t_hat / sigma_s_hat) as f32;
         let model_scale = (alpha_t * ((-h).exp() - 1.0)) as f32;
         sample
-            .broadcast_mul(&Tensor::new(sample_scale, sample.device())?)?
-            .broadcast_sub(
-                &model_output.broadcast_mul(&Tensor::new(model_scale, model_output.device())?)?,
-            )
+            .broadcast_mul(&Tensor::new(sample_scale, sample.device())?.to_dtype(sample.dtype())?)?
+            .broadcast_sub(&model_output.broadcast_mul(
+                &Tensor::new(model_scale, model_output.device())?.to_dtype(model_output.dtype())?,
+            )?)
     }
 
     fn second_order_update(&self, sample: &Tensor) -> Result<Tensor> {
@@ -308,16 +316,19 @@ impl DpmSolverMultistepScheduler {
         let h = lambda_t - lambda_s0;
         let h0 = lambda_s0 - lambda_s1;
         let r0 = h0 / h;
-        let d1 =
-            (m0.broadcast_sub(m1)?).broadcast_mul(&Tensor::new((1.0 / r0) as f32, m0.device())?)?;
+        let d1 = (m0.broadcast_sub(m1)?)
+            .broadcast_mul(&Tensor::new((1.0 / r0) as f32, m0.device())?.to_dtype(m0.dtype())?)?;
 
-        let sample_term = sample.broadcast_mul(&Tensor::new(
-            (sigma_t_hat / sigma_s0_hat) as f32,
-            sample.device(),
-        )?)?;
+        let sample_term = sample.broadcast_mul(
+            &Tensor::new((sigma_t_hat / sigma_s0_hat) as f32, sample.device())?
+                .to_dtype(sample.dtype())?,
+        )?;
         let coeff = alpha_t * ((-h).exp() - 1.0);
-        let d0_term = m0.broadcast_mul(&Tensor::new(coeff as f32, m0.device())?)?;
-        let d1_term = d1.broadcast_mul(&Tensor::new((0.5 * coeff) as f32, d1.device())?)?;
+        let d0_term =
+            m0.broadcast_mul(&Tensor::new(coeff as f32, m0.device())?.to_dtype(m0.dtype())?)?;
+        let d1_term = d1.broadcast_mul(
+            &Tensor::new((0.5 * coeff) as f32, d1.device())?.to_dtype(d1.dtype())?,
+        )?;
         sample_term.broadcast_sub(&d0_term.broadcast_add(&d1_term)?)
     }
 }
@@ -339,6 +350,7 @@ fn rms_norm_without_weight(x: &Tensor, eps: f64) -> Result<Tensor> {
 
 fn timestep_embedding(timesteps: &Tensor, dim: usize) -> Result<Tensor> {
     let device = timesteps.device().clone();
+    let dtype = timesteps.dtype();
     let timesteps = timesteps
         .to_dtype(DType::F32)?
         .flatten_all()?
@@ -362,7 +374,7 @@ fn timestep_embedding(timesteps: &Tensor, dim: usize) -> Result<Tensor> {
         }
     }
 
-    Tensor::from_vec(data, (batch, dim), &device)
+    Tensor::from_vec(data, (batch, dim), &device)?.to_dtype(dtype)
 }
 
 fn betas_for_alpha_bar(num_diffusion_timesteps: usize) -> Vec<f64> {
@@ -395,4 +407,17 @@ fn sigma_to_alpha_sigma_t(sigma: f64) -> (f64, f64) {
     let alpha_t = 1.0 / (sigma * sigma + 1.0).sqrt();
     let sigma_t = sigma * alpha_t;
     (alpha_t, sigma_t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    #[test]
+    fn timestep_embedding_keeps_the_input_dtype() -> Result<()> {
+        let timesteps = Tensor::new(&[1f32, 2.], &Device::Cpu)?.to_dtype(DType::BF16)?;
+        assert_eq!(timestep_embedding(&timesteps, 8)?.dtype(), DType::BF16);
+        Ok(())
+    }
 }

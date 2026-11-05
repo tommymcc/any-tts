@@ -216,7 +216,10 @@ impl VibeVoiceModel {
             return Ok(overrides);
         };
 
-        let speech_tensors = speech_inputs.speech_tensors.unsqueeze(1)?;
+        let speech_tensors = speech_inputs
+            .speech_tensors
+            .to_dtype(self.dtype)?
+            .unsqueeze(1)?;
         let encoder_output = self.acoustic_tokenizer.encode(&speech_tensors)?;
         let acoustic_latents = sample_encoder_output(
             &encoder_output,
@@ -413,7 +416,7 @@ impl VibeVoiceModel {
 
         let condition = Tensor::cat(&[positive_condition, negative_condition], 0)?;
         let mut speech = self.initial_diffusion_speech(diffusion_noise_cursor, rng)?;
-        let cfg_scale_tensor = Tensor::new(cfg_scale, &self.device)?;
+        let cfg_scale_tensor = Tensor::new(cfg_scale, &self.device)?.to_dtype(self.dtype)?;
 
         for timestep in scheduler.timesteps().to_vec() {
             speech = self.guided_diffusion_step(
@@ -628,8 +631,13 @@ impl VibeVoiceModel {
 
     fn unscale_generated_latents(&self, latents: &Tensor) -> Result<Tensor, TtsError> {
         latents
-            .broadcast_div(&Tensor::new(self.speech_scaling_factor, &self.device)?)?
-            .broadcast_sub(&Tensor::new(self.speech_bias_factor, &self.device)?)
+            .broadcast_div(
+                &Tensor::new(self.speech_scaling_factor, &self.device)?
+                    .to_dtype(latents.dtype())?,
+            )?
+            .broadcast_sub(
+                &Tensor::new(self.speech_bias_factor, &self.device)?.to_dtype(latents.dtype())?,
+            )
             .map_err(Into::into)
     }
 

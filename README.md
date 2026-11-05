@@ -241,14 +241,14 @@ Using these exact relative paths makes the byte-based API foolproof because the 
 | `instruct` | Natural-language style control | Most useful on OmniVoice and Qwen3. |
 | `max_tokens` | Upper bound on generated codec/audio tokens | Helpful for latency testing and smoke tests. |
 | `temperature` | Sampling temperature | Supported where the backend uses it. |
-| `speed` | Speaking-rate multiplier | Kokoro only; finite values from `0.1` through `5.0`, default `1.0`. |
+| `speed` | Speaking-rate multiplier | Kokoro: finite values from `0.1` through `5.0`, default `1.0`. OmniVoice: any finite value above zero, which divides the estimated audio length, so `max_tokens` takes priority over it. |
 | `cfg_scale` | Classifier-free guidance scale | Used by OmniVoice and other backends that expose CFG-like control. |
 | `reference_audio` | Reference clip for voice cloning or prompt conditioning | Used by backends such as VibeVoice when conditioning from speech; unsupported backends return an explicit error. |
 | `voice_embedding` | Precomputed embedding payload | Currently reusable with backends that accept embeddings directly. |
 
 Kokoro callers that previously used `with_temperature()` to change speaking
 rate should switch to `with_speed()`. Temperature no longer changes Kokoro's
-duration prediction. Other backends explicitly reject `speed` requests.
+duration prediction. OmniVoice also supports `speed`. Other backends explicitly reject it.
 
 ## Incremental audio
 
@@ -374,7 +374,7 @@ OmniVoice is the ambition play in this repo. Upstream, it is a diffusion languag
 **What works in any-tts today**
 
 - Native Candle backend.
-- `language`, `instruct`, `cfg_scale`, and `max_tokens` request controls.
+- `language`, `instruct`, `cfg_scale`, `max_tokens`, and `speed` request controls.
 - Automatic runtime preference selection for CPU, CUDA, or Metal.
 - Repo-exposed language set: `auto`, `en`, `zh`, `ja`, `ko`, `de`, `fr`, `es`, `pt`, `ru`, `it`.
 

@@ -7,6 +7,7 @@ use crate::config::{
 use crate::device::DeviceSelection;
 use crate::models::ModelType;
 
+mod audio_processing;
 mod audio_tokenizer;
 mod config;
 pub mod model;

@@ -16,6 +16,7 @@ use crate::tensor_utils::{precompute_rope_freqs, RmsNorm};
 use crate::tokenizer::TextTokenizer;
 use crate::traits::{ModelInfo, SynthesisRequest, TtsModel};
 
+use super::audio_processing::remove_silence;
 use super::audio_tokenizer::OmniVoiceAudioTokenizerDecoder;
 use super::config::{OmniVoiceAudioTokenizerConfig, OmniVoiceConfig};
 
@@ -356,8 +357,8 @@ impl TtsModel for OmniVoiceModel {
             &gen_config,
             speed,
         )?;
-        let mut samples = self.decode_token_chunks(&token_chunks)?;
-        post_process_audio(&mut samples, self.sample_rate());
+        let samples = self.decode_token_chunks(&token_chunks)?;
+        let samples = post_process_audio(&samples, self.sample_rate());
 
         Ok(AudioSamples::new(samples, self.sample_rate()))
     }
@@ -1577,29 +1578,32 @@ fn linspace_weight(start: f32, end: f32, index: usize, count: usize) -> f32 {
     }
 }
 
-fn post_process_audio(samples: &mut Vec<f32>, sample_rate: u32) {
+/// Removes long pauses, sets the level, and fades and pads the edges.
+fn post_process_audio(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    let mut samples = remove_silence(samples, sample_rate, 500, 100, 100);
     let peak = samples.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
     if peak > 1e-6 {
-        let scale = 0.5 / peak;
         for sample in samples.iter_mut() {
-            *sample = (*sample * scale).clamp(-1.0, 1.0);
+            *sample = *sample / peak * 0.5;
         }
+    }
+    if samples.is_empty() {
+        return samples;
     }
 
     let fade = (sample_rate as usize / 10).min(samples.len() / 2);
     for index in 0..fade {
-        let weight = linspace_weight(0.0, 1.0, index, fade);
-        samples[index] *= weight;
-        let tail = samples.len() - 1 - index;
+        samples[index] *= linspace_weight(0.0, 1.0, index, fade);
+        let tail = samples.len() - fade + index;
         samples[tail] *= linspace_weight(1.0, 0.0, index, fade);
     }
 
     let pad = sample_rate as usize / 10;
     let mut padded = Vec::with_capacity(samples.len() + pad * 2);
     padded.extend(std::iter::repeat_n(0.0, pad));
-    padded.extend(samples.iter().copied());
+    padded.extend(samples);
     padded.extend(std::iter::repeat_n(0.0, pad));
-    *samples = padded;
+    padded
 }
 
 fn index_2d(row: usize, col: usize, cols: usize) -> usize {
@@ -1709,6 +1713,17 @@ mod tests {
             "Reference. Helloworld again"
         );
         assert_eq!(combine_text("你 好 （test）", None), "你好(test)");
+    }
+
+    #[test]
+    fn post_processing_fades_out_to_silence() {
+        let out = post_process_audio(&vec![1.0f32; 24_000], 24_000);
+        let (pad, fade) = (2400, 2400);
+        assert_eq!(out.len(), 24_000 + 2 * pad);
+        assert_eq!(out[pad], 0.0);
+        // The fade-out starts at full level and ends at silence.
+        assert!((out[pad + 24_000 - fade] - 0.5).abs() < 1e-3);
+        assert_eq!(out[pad + 24_000 - 1], 0.0);
     }
 
     #[test]

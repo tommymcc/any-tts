@@ -296,7 +296,9 @@ pub fn sample_encoder_output(
         .to_dtype(output.mean.dtype())?;
     output
         .mean
-        .broadcast_add(&noise.broadcast_mul(&Tensor::new(std, device)?)?)
+        .broadcast_add(
+            &noise.broadcast_mul(&Tensor::new(std, device)?.to_dtype(output.mean.dtype())?)?,
+        )
         .map_err(Into::into)
 }
 
@@ -307,8 +309,8 @@ pub fn scale_acoustic_features(
     device: &Device,
 ) -> Result<Tensor, TtsError> {
     acoustic_latents
-        .broadcast_add(&Tensor::new(bias_factor, device)?)?
-        .broadcast_mul(&Tensor::new(scaling_factor, device)?)
+        .broadcast_add(&Tensor::new(bias_factor, device)?.to_dtype(acoustic_latents.dtype())?)?
+        .broadcast_mul(&Tensor::new(scaling_factor, device)?.to_dtype(acoustic_latents.dtype())?)
         .map_err(Into::into)
 }
 

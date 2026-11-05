@@ -3,7 +3,7 @@
 //! Provides Conv1d, ConvTranspose1d, and related utilities used by
 //! Kokoro's ISTFTNet decoder and text encoder.
 
-use candle_core::{Module, Result, Tensor};
+use candle_core::{DType, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
 fn scalar_like(tensor: &Tensor, value: f32) -> Result<Tensor> {
@@ -71,6 +71,8 @@ impl Conv1d {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let out = if self.groups == 1 {
             x.conv1d(&self.weight, self.padding, self.stride, self.dilation, 1)?
+        } else if self.is_depthwise(x) {
+            self.forward_depthwise(x)?
         } else {
             // candle supports groups parameter
             x.conv1d(
@@ -88,6 +90,46 @@ impl Conv1d {
             }
             None => Ok(out),
         }
+    }
+
+    fn is_depthwise(&self, x: &Tensor) -> bool {
+        self.padding == 0
+            && self.stride == 1
+            && x.dim(1).is_ok_and(|channels| channels == self.groups)
+            && self.weight.dim(0).is_ok_and(|out| out == self.groups)
+    }
+
+    /// Depthwise convolution as one multiply per kernel position.
+    ///
+    /// candle runs grouped convolutions as one convolution per group, which
+    /// costs thousands of device calls per layer at high channel counts.
+    fn forward_depthwise(&self, x: &Tensor) -> Result<Tensor> {
+        let (_, _, length) = x.dims3()?;
+        let (_, _, kernel_size) = self.weight.dims3()?;
+        let span = (kernel_size - 1) * self.dilation;
+        if length <= span {
+            candle_core::bail!(
+                "depthwise conv1d input of length {length} is shorter than the kernel span {span}"
+            )
+        }
+        let out_length = length - span;
+        // Accumulate in F32 so low-precision models don't round every term.
+        let dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?;
+        let kernel = self.weight.to_dtype(DType::F32)?;
+        let mut out: Option<Tensor> = None;
+        for position in 0..kernel_size {
+            let weight = kernel.narrow(2, position, 1)?.permute((1, 0, 2))?;
+            let term = x
+                .narrow(2, position * self.dilation, out_length)?
+                .broadcast_mul(&weight)?;
+            out = Some(match out {
+                Some(sum) => sum.add(&term)?,
+                None => term,
+            });
+        }
+        out.ok_or_else(|| candle_core::Error::Msg("conv1d kernel is empty".to_string()))?
+            .to_dtype(dtype)
     }
 
     /// Get a reference to the weight tensor.
@@ -427,5 +469,37 @@ mod tests {
         let x = Tensor::randn(0f32, 1.0, (2, 10, 16), &device).unwrap();
         let out = linear.forward(&x).unwrap();
         assert_eq!(out.dims(), &[2, 10, 32]);
+    }
+
+    #[test]
+    fn depthwise_matches_grouped_convolution() {
+        let device = Device::Cpu;
+        for dilation in [1, 2] {
+            let x = Tensor::randn(0f32, 1.0, (2, 4, 30), &device).unwrap();
+            let weight = Tensor::randn(0f32, 1.0, (4, 1, 7), &device).unwrap();
+            let conv = Conv1d {
+                weight: weight.clone(),
+                bias: None,
+                stride: 1,
+                padding: 0,
+                dilation,
+                groups: 4,
+            };
+            assert!(conv.is_depthwise(&x));
+            let expected = x.conv1d(&weight, 0, 1, dilation, 4).unwrap();
+            let actual = conv.forward(&x).unwrap();
+            assert_eq!(expected.dims(), actual.dims());
+            let max_error = (expected - actual)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(max_error < 1e-5, "max error {max_error}");
+        }
     }
 }

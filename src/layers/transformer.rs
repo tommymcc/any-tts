@@ -76,6 +76,23 @@ impl TransformerBlock {
         residual + out
     }
 
+    /// Forward pass over a whole sequence that bypasses the KV-cache.
+    pub fn forward_uncached(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let h = self.input_layernorm.forward(x)?;
+        let h = self.self_attn.forward_uncached(&h, cos, sin, mask)?;
+        let h = (x + h)?;
+
+        let out = self.post_attention_layernorm.forward(&h)?;
+        let out = self.mlp.forward(&out)?;
+        h + out
+    }
+
     /// Clear the attention KV-cache.
     pub fn clear_cache(&mut self) {
         self.self_attn.clear_cache();

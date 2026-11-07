@@ -138,8 +138,10 @@ impl GroupedQueryAttention {
     /// Forward pass with rotary embeddings and optional KV-cache.
     ///
     /// * `x`     — (batch, seq_len, hidden_size)
-    /// * `cos`   — (max_seq, head_dim) precomputed RoPE cos
-    /// * `sin`   — (max_seq, head_dim) precomputed RoPE sin
+    /// * `cos`   — (max_seq, head_dim) precomputed RoPE cos, or the
+    ///   (max_seq, head_dim / 2) table of [`crate::tensor_utils::precompute_rope_half_freqs`],
+    ///   which selects the fused RoPE kernel
+    /// * `sin`   — the matching sin table
     /// * `start_pos` — position offset for KV-cache (0 for full sequence)
     /// * `mask`  — optional causal attention mask
     pub fn forward(
@@ -150,31 +152,62 @@ impl GroupedQueryAttention {
         start_pos: usize,
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let (batch, seq_len, _) = x.dims3()?;
         if start_pos != self.kv_cache.len() {
             candle_core::bail!(
                 "attention position {start_pos} differs from KV cache length {}",
                 self.kv_cache.len()
             )
         }
+        let (q, k, v) = self.project(x, cos, sin, start_pos)?;
+        let (k, v) = self.kv_cache.append(&k, &v)?;
+        self.attend(&q, &k, &v, mask)
+    }
 
-        // Project Q, K, V
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+    /// Forward pass over a whole sequence that neither reads nor fills the
+    /// KV-cache, for models that run every position at once.
+    pub fn forward_uncached(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (q, k, v) = self.project(x, cos, sin, 0)?;
+        // Heads-first views of the projections, which matrix products can't read.
+        let (k, v) = if x.device().is_cpu() {
+            (k, v)
+        } else {
+            (k.contiguous()?, v.contiguous()?)
+        };
+        self.attend(&q, &k, &v, mask)
+    }
 
-        // Reshape to (batch, heads, seq_len, head_dim)
-        let q = q
-            .reshape((batch, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+    /// Q, K and V after QK-norm and RoPE, as (batch, heads, seq_len, head_dim).
+    fn project(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        start_pos: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (batch, seq_len, _) = x.dims3()?;
 
-        // Apply QK-norm if present (Qwen3-style)
+        // Project Q, K, V to (batch, seq_len, heads, head_dim)
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((batch, seq_len, self.num_heads, self.head_dim))?;
+        let k =
+            self.k_proj
+                .forward(x)?
+                .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
+        let v =
+            self.v_proj
+                .forward(x)?
+                .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
+
+        // Apply QK-norm if present (Qwen3-style). It normalises each head, so
+        // it can run before the transpose, while the input is contiguous.
         let q = if let Some(ref qn) = self.q_norm {
             qn.forward(&q)?
         } else {
@@ -187,80 +220,46 @@ impl GroupedQueryAttention {
         };
 
         // Apply RoPE
-        let cos_slice = cos
-            .narrow(0, start_pos, seq_len)?
-            .unsqueeze(0)?
-            .unsqueeze(0)?;
-        let sin_slice = sin
-            .narrow(0, start_pos, seq_len)?
-            .unsqueeze(0)?
-            .unsqueeze(0)?;
-        let (q, k) = apply_rotary_emb(&q, &k, &cos_slice, &sin_slice)?;
+        let (q, k) = if cos.dim(1)? * 2 == self.head_dim {
+            let cos = cos.narrow(0, start_pos, seq_len)?;
+            let sin = sin.narrow(0, start_pos, seq_len)?;
+            let q = candle_nn::rotary_emb::rope_thd(&q.contiguous()?, &cos, &sin)?;
+            let k = candle_nn::rotary_emb::rope_thd(&k.contiguous()?, &cos, &sin)?;
+            (q.transpose(1, 2)?, k.transpose(1, 2)?)
+        } else {
+            let cos_slice = cos
+                .narrow(0, start_pos, seq_len)?
+                .unsqueeze(0)?
+                .unsqueeze(0)?;
+            let sin_slice = sin
+                .narrow(0, start_pos, seq_len)?
+                .unsqueeze(0)?
+                .unsqueeze(0)?;
+            apply_rotary_emb(
+                &q.transpose(1, 2)?,
+                &k.transpose(1, 2)?,
+                &cos_slice,
+                &sin_slice,
+            )?
+        };
+        Ok((q, k, v.transpose(1, 2)?))
+    }
 
-        // Update KV-cache
-        let (k, v) = self.kv_cache.append(&k, &v)?;
-
+    /// Attention over heads-first Q, K and V, then the output projection.
+    fn attend(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+        let (batch, _, seq_len, _) = q.dims4()?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        let attn_output =
-            if let Some(cpu_attn_output) = cpu_flash_attention(&q, &k, &v, mask, scale)? {
-                cpu_attn_output
-            } else if seq_len == 1
-                && mask.is_none()
-                && matches!(x.device(), candle_core::Device::Metal(_))
-            {
-                candle_nn::ops::sdpa(&q.contiguous()?, &k, &v, None, false, scale, 1.0)?
-            } else {
-                // Repeat KV heads to match Q heads (GQA expansion)
-                // Use repeat_interleave semantics: [h0,h0,h1,h1,...] not repeat: [h0..h7,h0..h7]
-                // so that Q head i pairs with KV head i/repeat_factor. Broadcasting costs one
-                // strided copy on CUDA, where `repeat` costs a transpose and cat per dimension.
-                let repeat_factor = self.num_heads / self.num_kv_heads;
-                let kv_len = k.dim(2)?;
-                let k = if repeat_factor > 1 {
-                    k.unsqueeze(2)?
-                        .broadcast_as((
-                            batch,
-                            self.num_kv_heads,
-                            repeat_factor,
-                            kv_len,
-                            self.head_dim,
-                        ))?
-                        .reshape((batch, self.num_heads, kv_len, self.head_dim))?
-                } else {
-                    k
-                };
-                let v = if repeat_factor > 1 {
-                    v.unsqueeze(2)?
-                        .broadcast_as((
-                            batch,
-                            self.num_kv_heads,
-                            repeat_factor,
-                            kv_len,
-                            self.head_dim,
-                        ))?
-                        .reshape((batch, self.num_heads, kv_len, self.head_dim))?
-                } else {
-                    v
-                };
-
-                // Dense CPU GEMM (including Accelerate) has stricter matrix
-                // and batch stride requirements than fused attention.
-                let (k, v) = if x.device().is_cpu() {
-                    (k.contiguous()?, v.contiguous()?)
-                } else {
-                    (k, v)
-                };
-
-                let attn_weights = q.matmul(&k.transpose(2, 3)?)?.affine(scale as f64, 0.0)?;
-                let attn_weights = if let Some(mask) = mask {
-                    attn_weights.broadcast_add(mask)?
-                } else {
-                    attn_weights
-                };
-
-                let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-                attn_weights.matmul(&v)?
-            };
+        let attn_output = if let Some(cpu_attn_output) = cpu_flash_attention(q, k, v, mask, scale)?
+        {
+            cpu_attn_output
+        } else if seq_len == 1
+            && mask.is_none()
+            && matches!(q.device(), candle_core::Device::Metal(_))
+        {
+            candle_nn::ops::sdpa(&q.contiguous()?, k, v, None, false, scale, 1.0)?
+        } else {
+            self.grouped_attention(q, k, v, mask, scale)?
+        };
 
         // Reshape back: (batch, num_heads, seq_len, head_dim) → (batch, seq_len, hidden)
         let attn_output = attn_output.transpose(1, 2)?.reshape((
@@ -271,6 +270,57 @@ impl GroupedQueryAttention {
 
         // Output projection
         self.o_proj.forward(&attn_output)
+    }
+
+    /// Dense attention that shares each KV head with its group of Q heads.
+    ///
+    /// Q head `i` pairs with KV head `i / group` (repeat_interleave semantics).
+    /// Viewing Q as (batch, kv_heads, group * seq_len, head_dim) lets each KV
+    /// head serve its whole group in one matrix product, so K and V are never
+    /// copied out to every Q head.
+    fn grouped_attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+        scale: f32,
+    ) -> Result<Tensor> {
+        let (batch, _, seq_len, _) = q.dims4()?;
+        let kv_len = k.dim(2)?;
+        let group = self.num_heads / self.num_kv_heads;
+
+        // Scaling Q, not the scores, touches head_dim values per position
+        // instead of kv_len, and writes Q out contiguously in the same kernel.
+        let q = q.affine(scale as f64, 0.0)?.reshape((
+            batch,
+            self.num_kv_heads,
+            group * seq_len,
+            self.head_dim,
+        ))?;
+
+        // Dense CPU GEMM (including Accelerate) has stricter matrix
+        // and batch stride requirements than fused attention.
+        let (k, v) = if q.device().is_cpu() {
+            (k.contiguous()?, v.contiguous()?)
+        } else {
+            (k.clone(), v.clone())
+        };
+
+        let attn_weights = q.matmul(&k.t()?)?;
+        let attn_weights = if let Some(mask) = mask {
+            attn_weights
+                .reshape((batch, self.num_heads, seq_len, kv_len))?
+                .broadcast_add(mask)?
+                .reshape((batch, self.num_kv_heads, group * seq_len, kv_len))?
+        } else {
+            attn_weights
+        };
+
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        attn_weights
+            .matmul(&v)?
+            .reshape((batch, self.num_heads, seq_len, self.head_dim))
     }
 
     /// Clear the KV-cache (call between independent sequences).
@@ -385,6 +435,95 @@ mod tests {
         assert!(incremental
             .forward(&input.narrow(1, 0, 1)?, &cos, &sin, 0, None)
             .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_uncached_attention_matches_repeated_kv_heads() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, heads, kv_heads, head_dim, seq) = (32, 4, 2, 8, 5);
+        let mut weights = HashMap::new();
+        for (index, (name, rows)) in [
+            ("q_proj.weight", heads * head_dim),
+            ("k_proj.weight", kv_heads * head_dim),
+            ("v_proj.weight", kv_heads * head_dim),
+            ("o_proj.weight", hidden),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let values: Vec<f32> = (0..rows * hidden)
+                .map(|i| ((i + 7 * index) as f32 * 0.13).sin() * 0.1)
+                .collect();
+            weights.insert(
+                name.to_string(),
+                Tensor::from_vec(values, (*rows, hidden), &device)?,
+            );
+        }
+        for name in ["q_norm.weight", "k_norm.weight"] {
+            let values: Vec<f32> = (0..head_dim).map(|i| 0.5 + i as f32 * 0.1).collect();
+            weights.insert(
+                name.to_string(),
+                Tensor::from_vec(values, head_dim, &device)?,
+            );
+        }
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &device);
+        let config = GqaConfig::with_head_dim(hidden, heads, kv_heads, head_dim, 64, 1e4, 1e-6);
+        let attention = GroupedQueryAttention::load(&config, vb)?;
+        let values: Vec<f32> = (0..2 * seq * hidden)
+            .map(|i| (i as f32 * 0.07).cos())
+            .collect();
+        let input = Tensor::from_vec(values, (2, seq, hidden), &device)?;
+        let (cos, sin) =
+            crate::tensor_utils::precompute_rope_freqs(head_dim, 64, 1e4, &device, DType::F32)?;
+        let (half_cos, half_sin) = crate::tensor_utils::precompute_rope_half_freqs(
+            head_dim,
+            64,
+            1e4,
+            &device,
+            DType::F32,
+        )?;
+        let actual = attention.forward_uncached(&input, &half_cos, &half_sin, None)?;
+
+        // Reference: Qwen3 attention with every KV head copied out to its Q heads.
+        let project = |name: &str, n: usize| -> Result<Tensor> {
+            let w = &weights[&format!("{name}_proj.weight")];
+            input
+                .broadcast_matmul(&w.t()?)?
+                .reshape((2, seq, n, head_dim))?
+                .transpose(1, 2)
+        };
+        let norm = |x: Tensor, name: &str| -> Result<Tensor> {
+            let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+            x.broadcast_div(&(variance + 1e-6)?.sqrt()?)?
+                .broadcast_mul(&weights[name])
+        };
+        let q = norm(project("q", heads)?, "q_norm.weight")?;
+        let k = norm(project("k", kv_heads)?, "k_norm.weight")?;
+        let v = project("v", kv_heads)?;
+        let (cos, sin) = (
+            cos.narrow(0, 0, seq)?.unsqueeze(0)?.unsqueeze(0)?,
+            sin.narrow(0, 0, seq)?.unsqueeze(0)?.unsqueeze(0)?,
+        );
+        let (q, k) = apply_rotary_emb(&q.contiguous()?, &k.contiguous()?, &cos, &sin)?;
+        let repeat = |x: &Tensor| -> Result<Tensor> {
+            let parts: Vec<Tensor> = (0..heads)
+                .map(|head| x.narrow(1, head / (heads / kv_heads), 1))
+                .collect::<Result<_>>()?;
+            Tensor::cat(&parts, 1)?.contiguous()
+        };
+        let (k, v) = (repeat(&k)?, repeat(&v.contiguous()?)?);
+        let scores = (q.matmul(&k.t()?)? / (head_dim as f64).sqrt())?;
+        let expected = candle_nn::ops::softmax_last_dim(&scores)?
+            .matmul(&v)?
+            .transpose(1, 2)?
+            .reshape((2, seq, heads * head_dim))?
+            .broadcast_matmul(&weights["o_proj.weight"].t()?)?;
+        let difference = (&actual - &expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(difference < 1e-5, "grouped attention error: {difference}");
         Ok(())
     }
 }

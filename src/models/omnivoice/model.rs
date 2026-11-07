@@ -12,7 +12,7 @@ use crate::config::{ModelFiles, TtsConfig};
 use crate::error::TtsError;
 use crate::layers::attention::GqaConfig;
 use crate::layers::transformer::TransformerBlock;
-use crate::tensor_utils::{precompute_rope_freqs, RmsNorm};
+use crate::tensor_utils::{precompute_rope_half_freqs, RmsNorm};
 use crate::tokenizer::TextTokenizer;
 use crate::traits::{ModelInfo, ReferenceAudio, SynthesisRequest, TtsModel};
 
@@ -161,7 +161,7 @@ impl OmniVoiceBackbone {
             )?);
         }
 
-        let (rope_cos, rope_sin) = precompute_rope_freqs(
+        let (rope_cos, rope_sin) = precompute_rope_half_freqs(
             gqa_config.head_dim,
             llm.max_position_embeddings,
             llm.rope_theta(),
@@ -189,17 +189,16 @@ impl OmniVoiceBackbone {
         })
     }
 
+    /// Audio logits, (batch, codebooks, logits_len, audio_vocab), for the last
+    /// `logits_len` positions of the sequence.
     fn forward(
-        &mut self,
+        &self,
         input_ids: &Tensor,
         audio_mask_u32: &Tensor,
         audio_mask_f32: &Tensor,
         attention_mask: Option<&Tensor>,
+        logits_len: usize,
     ) -> Result<Tensor, TtsError> {
-        for layer in &mut self.layers {
-            layer.clear_cache();
-        }
-
         let text_ids = input_ids.i((.., 0, ..))?;
         let text_embeds = self.text_embeddings.forward(&text_ids)?;
 
@@ -209,22 +208,27 @@ impl OmniVoiceBackbone {
         let audio_embeds = self.audio_embeddings.forward(&shifted_audio_ids)?.sum(1)?;
 
         let audio_mask = audio_mask_f32.to_dtype(text_embeds.dtype())?.unsqueeze(2)?;
-        let text_mask = audio_mask.neg()?.add(&Tensor::ones_like(&audio_mask)?)?;
+        let text_mask = audio_mask.affine(-1.0, 1.0)?;
         let mut hidden = text_embeds
             .broadcast_mul(&text_mask)?
             .add(&audio_embeds.broadcast_mul(&audio_mask)?)?;
 
-        for layer in &mut self.layers {
-            hidden = layer.forward(&hidden, &self.rope_cos, &self.rope_sin, 0, attention_mask)?;
+        for layer in &self.layers {
+            hidden =
+                layer.forward_uncached(&hidden, &self.rope_cos, &self.rope_sin, attention_mask)?;
         }
-        hidden = self.norm.forward(&hidden)?;
-
+        // Only the positions whose logits are read need the norm and the head.
         let (batch, seq_len, _) = hidden.dims3()?;
+        let hidden = hidden
+            .narrow(1, seq_len - logits_len, logits_len)?
+            .contiguous()?;
+        let hidden = self.norm.forward(&hidden)?;
+
         let logits_flat = self.audio_head.forward(&hidden)?;
         logits_flat
             .reshape((
                 batch,
-                seq_len,
+                logits_len,
                 self.config.num_audio_codebook,
                 self.config.audio_vocab_size,
             ))?
@@ -729,9 +733,9 @@ impl OmniVoiceModel {
                     &cond_audio_mask_u32,
                     &cond_audio_mask_f32,
                     cond_attention_mask.as_ref(),
+                    target_len,
                 )?
-                .to_dtype(DType::F32)?
-                .i((0..1, .., cond_len - target_len..cond_len, ..))?;
+                .to_dtype(DType::F32)?;
             let u_logits =
                 if gen_config.guidance_scale != 0.0 {
                     let uncond_input_ids_tensor =
@@ -748,6 +752,7 @@ impl OmniVoiceModel {
                             &uncond_audio_mask_u32,
                             &uncond_audio_mask_f32,
                             uncond_attention_mask.as_ref(),
+                            target_len,
                         )?
                         .to_dtype(DType::F32)?;
                     Some(logits)
@@ -2092,13 +2097,9 @@ mod tests {
             &Tensor::new(mask_u32.as_slice(), device)?.reshape((1, seq_len))?,
             &Tensor::new(mask_f32.as_slice(), device)?.reshape((1, seq_len))?,
             None,
+            estimate,
         )?;
-        let first = cond.to_dtype(DType::F32)?.i((
-            0,
-            ..,
-            seq_len - estimate..seq_len - estimate + 4,
-            ..,
-        ))?;
+        let first = cond.to_dtype(DType::F32)?.i((0, .., 0..4, ..))?;
         let actual = first.flatten_all()?.to_vec1::<f32>()?;
         let expected = floats("cond_logits_0")?;
         let diff = max_diff(&actual, &expected);

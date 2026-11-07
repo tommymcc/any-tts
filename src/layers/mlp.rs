@@ -10,8 +10,6 @@
 use candle_core::{Result, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
-use crate::tensor_utils::silu;
-
 /// SiLU-gated feed-forward network.
 pub struct SiluMlp {
     gate_proj: Linear,
@@ -42,7 +40,8 @@ impl SiluMlp {
 
     /// Forward pass: `down_proj( silu(gate_proj(x)) * up_proj(x) )`
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = silu(&self.gate_proj.forward(x)?)?;
+        // One fused SiLU kernel, rather than a sigmoid and a product.
+        let gate = self.gate_proj.forward(x)?.silu()?;
         let up = self.up_proj.forward(x)?;
         self.down_proj.forward(&(gate * up)?)
     }

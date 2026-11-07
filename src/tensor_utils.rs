@@ -25,6 +25,11 @@ impl RmsNorm {
 
     /// Apply RMS normalization.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // On an accelerator one fused kernel replaces the chain below. It reads
+        // and writes the activation dtype but sums squares and scales in F32.
+        if !x.device().is_cpu() && x.is_contiguous() && x.dtype() == self.weight.dtype() {
+            return candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32);
+        }
         let dtype = x.dtype();
         let shape = x.shape().clone();
         let x = x.to_dtype(candle_core::DType::F32)?;
@@ -80,6 +85,42 @@ pub fn precompute_rope_freqs(
     device: &Device,
     target_dtype: DType,
 ) -> Result<(Tensor, Tensor)> {
+    let (cos, sin) = rope_half_angles(head_dim, max_seq_len, theta, device)?;
+
+    // Duplicate for full head_dim: (seq_len, head_dim)
+    let cos = Tensor::cat(&[&cos, &cos], candle_core::D::Minus1)?;
+    let sin = Tensor::cat(&[&sin, &sin], candle_core::D::Minus1)?;
+
+    // Cast to target dtype so RoPE matches model weight dtype (e.g. BF16).
+    let cos = cos.to_dtype(target_dtype)?;
+    let sin = sin.to_dtype(target_dtype)?;
+
+    Ok((cos, sin))
+}
+
+/// Precompute half-width `(max_seq_len, head_dim / 2)` RoPE tables.
+///
+/// These are the tables `candle_nn::rotary_emb` expects. Passing them to
+/// [`crate::layers::attention::GroupedQueryAttention::forward`] in place of
+/// the full-width tables selects the fused RoPE kernel.
+pub fn precompute_rope_half_freqs(
+    head_dim: usize,
+    max_seq_len: usize,
+    theta: f64,
+    device: &Device,
+    target_dtype: DType,
+) -> Result<(Tensor, Tensor)> {
+    let (cos, sin) = rope_half_angles(head_dim, max_seq_len, theta, device)?;
+    Ok((cos.to_dtype(target_dtype)?, sin.to_dtype(target_dtype)?))
+}
+
+/// F32 `(cos, sin)` of the RoPE angles, `(max_seq_len, head_dim / 2)` each.
+fn rope_half_angles(
+    head_dim: usize,
+    max_seq_len: usize,
+    theta: f64,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
     let half_dim = head_dim / 2;
     let freqs: Vec<f32> = (0..half_dim)
         .map(|i| 1.0 / theta.powf(i as f64 / half_dim as f64) as f32)
@@ -94,18 +135,7 @@ pub fn precompute_rope_freqs(
         .unsqueeze(1)?
         .broadcast_mul(&freqs.unsqueeze(0)?)?;
 
-    let cos = angles.cos()?;
-    let sin = angles.sin()?;
-
-    // Duplicate for full head_dim: (seq_len, head_dim)
-    let cos = Tensor::cat(&[&cos, &cos], candle_core::D::Minus1)?;
-    let sin = Tensor::cat(&[&sin, &sin], candle_core::D::Minus1)?;
-
-    // Cast to target dtype so RoPE matches model weight dtype (e.g. BF16).
-    let cos = cos.to_dtype(target_dtype)?;
-    let sin = sin.to_dtype(target_dtype)?;
-
-    Ok((cos, sin))
+    Ok((angles.cos()?, angles.sin()?))
 }
 
 /// SiLU (Sigmoid Linear Unit) activation: x * sigmoid(x)

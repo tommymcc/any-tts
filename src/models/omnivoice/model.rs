@@ -12,7 +12,7 @@ use crate::config::{ModelFiles, TtsConfig};
 use crate::error::TtsError;
 use crate::layers::attention::GqaConfig;
 use crate::layers::transformer::TransformerBlock;
-use crate::tensor_utils::{precompute_rope_half_freqs, RmsNorm};
+use crate::tensor_utils::{precompute_rope_half_freqs, KernelMode, RmsNorm};
 use crate::tokenizer::TextTokenizer;
 use crate::traits::{ModelInfo, ReferenceAudio, SynthesisRequest, TtsModel};
 
@@ -136,7 +136,8 @@ impl OmniVoiceBackbone {
             llm.max_position_embeddings,
             llm.rope_theta(),
             llm.rms_norm_eps,
-        );
+        )
+        .with_kernels(KernelMode::Fused);
 
         let text_embeddings =
             candle_nn::embedding(llm.vocab_size, llm.hidden_size, vb.pp("llm.embed_tokens"))?;
@@ -150,7 +151,8 @@ impl OmniVoiceBackbone {
             config.num_audio_codebook * config.audio_vocab_size,
             vb.pp("audio_heads"),
         )?;
-        let norm = RmsNorm::load(llm.hidden_size, llm.rms_norm_eps, vb.pp("llm.norm"))?;
+        let norm = RmsNorm::load(llm.hidden_size, llm.rms_norm_eps, vb.pp("llm.norm"))?
+            .with_kernels(KernelMode::Fused);
 
         let mut layers = Vec::with_capacity(llm.num_hidden_layers);
         for layer_index in 0..llm.num_hidden_layers {
@@ -208,7 +210,7 @@ impl OmniVoiceBackbone {
         let audio_embeds = self.audio_embeddings.forward(&shifted_audio_ids)?.sum(1)?;
 
         let audio_mask = audio_mask_f32.to_dtype(text_embeds.dtype())?.unsqueeze(2)?;
-        let text_mask = audio_mask.affine(-1.0, 1.0)?;
+        let text_mask = audio_mask.neg()?.add(&Tensor::ones_like(&audio_mask)?)?;
         let mut hidden = text_embeds
             .broadcast_mul(&text_mask)?
             .add(&audio_embeds.broadcast_mul(&audio_mask)?)?;

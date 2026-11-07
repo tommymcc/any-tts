@@ -22,7 +22,8 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    /// Load one decoder layer from a VarBuilder.
+    /// Load one decoder layer from a VarBuilder, with the kernels
+    /// `config.kernels` chooses.
     ///
     /// Expected sub-paths:
     /// - `input_layernorm.weight`
@@ -34,7 +35,8 @@ impl TransformerBlock {
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("input_layernorm"),
-        )?;
+        )?
+        .with_kernels(config.kernels);
 
         let self_attn = GroupedQueryAttention::load(config, vb.pp("self_attn"))?;
 
@@ -42,9 +44,11 @@ impl TransformerBlock {
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
-        )?;
+        )?
+        .with_kernels(config.kernels);
 
-        let mlp = SiluMlp::load(config.hidden_size, intermediate_size, vb.pp("mlp"))?;
+        let mlp = SiluMlp::load(config.hidden_size, intermediate_size, vb.pp("mlp"))?
+            .with_kernels(config.kernels);
 
         Ok(Self {
             input_layernorm,
@@ -64,16 +68,9 @@ impl TransformerBlock {
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         // Self-attention with pre-norm
-        let residual = x;
         let h = self.input_layernorm.forward(x)?;
         let h = self.self_attn.forward(&h, cos, sin, start_pos, mask)?;
-        let h = (residual + h)?;
-
-        // MLP with pre-norm
-        let residual = &h;
-        let out = self.post_attention_layernorm.forward(&h)?;
-        let out = self.mlp.forward(&out)?;
-        residual + out
+        self.add_attention_and_mlp(x, &h)
     }
 
     /// Forward pass over a whole sequence that bypasses the KV-cache.
@@ -84,13 +81,21 @@ impl TransformerBlock {
         sin: &Tensor,
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        // Self-attention with pre-norm
         let h = self.input_layernorm.forward(x)?;
         let h = self.self_attn.forward_uncached(&h, cos, sin, mask)?;
-        let h = (x + h)?;
+        self.add_attention_and_mlp(x, &h)
+    }
 
+    /// The attention residual, then the MLP with pre-norm and its residual.
+    fn add_attention_and_mlp(&self, residual: &Tensor, attention: &Tensor) -> Result<Tensor> {
+        let h = (residual + attention)?;
+
+        // MLP with pre-norm
+        let residual = &h;
         let out = self.post_attention_layernorm.forward(&h)?;
         let out = self.mlp.forward(&out)?;
-        h + out
+        residual + out
     }
 
     /// Clear the attention KV-cache.

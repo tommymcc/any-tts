@@ -2,6 +2,19 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 
+/// Which kernels a layer runs.
+///
+/// `Composite` builds each op from elementwise tensor operations, as every
+/// model always has. `Fused` uses candle's fused kernels (RMSNorm, RoPE,
+/// SiLU) and grouped attention. Their results differ in rounding, so a model
+/// opts in only once its output has been checked with them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KernelMode {
+    #[default]
+    Composite,
+    Fused,
+}
+
 /// RMS Layer Normalization.
 ///
 /// Used by Qwen-family backbones and talkers.
@@ -9,12 +22,27 @@ use candle_core::{DType, Device, Result, Tensor};
 pub struct RmsNorm {
     weight: Tensor,
     eps: f64,
+    kernels: KernelMode,
 }
 
 impl RmsNorm {
     /// Create a new RmsNorm layer.
     pub fn new(weight: Tensor, eps: f64) -> Self {
-        Self { weight, eps }
+        Self {
+            weight,
+            eps,
+            kernels: KernelMode::Composite,
+        }
+    }
+
+    /// Choose the kernels [`Self::forward`] runs.
+    ///
+    /// With [`KernelMode::Fused`] the input must be contiguous and have the
+    /// weight's dtype. The kernel reads and writes that dtype but sums squares
+    /// and scales in F32.
+    pub fn with_kernels(mut self, kernels: KernelMode) -> Self {
+        self.kernels = kernels;
+        self
     }
 
     /// Load from a `candle_nn::VarBuilder` with the given hidden size.
@@ -25,9 +53,7 @@ impl RmsNorm {
 
     /// Apply RMS normalization.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // On an accelerator one fused kernel replaces the chain below. It reads
-        // and writes the activation dtype but sums squares and scales in F32.
-        if !x.device().is_cpu() && x.is_contiguous() && x.dtype() == self.weight.dtype() {
+        if self.kernels == KernelMode::Fused {
             return candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32);
         }
         let dtype = x.dtype();
@@ -100,9 +126,11 @@ pub fn precompute_rope_freqs(
 
 /// Precompute half-width `(max_seq_len, head_dim / 2)` RoPE tables.
 ///
-/// These are the tables `candle_nn::rotary_emb` expects. Passing them to
-/// [`crate::layers::attention::GroupedQueryAttention::forward`] in place of
-/// the full-width tables selects the fused RoPE kernel.
+/// These are the tables `candle_nn::rotary_emb` expects. Attention built with
+/// [`KernelMode::Fused`] takes them, in both
+/// [`crate::layers::attention::GroupedQueryAttention::forward`] and
+/// [`crate::layers::attention::GroupedQueryAttention::forward_uncached`];
+/// [`KernelMode::Composite`] takes the full-width [`precompute_rope_freqs`].
 pub fn precompute_rope_half_freqs(
     head_dim: usize,
     max_seq_len: usize,
@@ -255,6 +283,20 @@ mod tests {
                 expected.flatten_all()?.to_vec1::<f32>()?
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_rms_norm_matches_composite() -> Result<()> {
+        let device = Device::Cpu;
+        let weight = Tensor::new(&[1f32, 2., 3., 4.], &device)?;
+        let x = Tensor::arange(1f32, 25., &device)?.reshape((2, 3, 4))?;
+        let composite = RmsNorm::new(weight.clone(), 1e-6).forward(&x)?;
+        let fused = RmsNorm::new(weight, 1e-6)
+            .with_kernels(KernelMode::Fused)
+            .forward(&x)?;
+        let difference = (fused - composite)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(difference < 1e-5, "fused RMSNorm error {difference}");
         Ok(())
     }
 

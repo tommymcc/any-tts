@@ -225,19 +225,7 @@ impl OmniVoiceBackbone {
         attention_mask: Option<&Tensor>,
         logits_len: usize,
     ) -> Result<Tensor, TtsError> {
-        let text_ids = input_ids.i((.., 0, ..))?;
-        let text_embeds = self.text_embeddings.forward(&text_ids)?;
-
-        let shifted_audio_ids = input_ids
-            .broadcast_mul(&audio_mask_u32.unsqueeze(1)?)?
-            .broadcast_add(&self.codebook_layer_offsets)?;
-        let audio_embeds = self.audio_embeddings.forward(&shifted_audio_ids)?.sum(1)?;
-
-        let audio_mask = audio_mask_f32.to_dtype(text_embeds.dtype())?.unsqueeze(2)?;
-        let text_mask = audio_mask.neg()?.add(&Tensor::ones_like(&audio_mask)?)?;
-        let mut hidden = text_embeds
-            .broadcast_mul(&text_mask)?
-            .add(&audio_embeds.broadcast_mul(&audio_mask)?)?;
+        let mut hidden = self.embed(input_ids, audio_mask_u32, audio_mask_f32)?;
 
         #[cfg(feature = "rocm")]
         if let Some(burn) = &self.burn {
@@ -275,6 +263,58 @@ impl OmniVoiceBackbone {
             ))?
             .transpose(1, 2)
             .map_err(Into::into)
+    }
+
+    /// The summed text and audio embeddings, (batch, seq, hidden).
+    fn embed(
+        &self,
+        input_ids: &Tensor,
+        audio_mask_u32: &Tensor,
+        audio_mask_f32: &Tensor,
+    ) -> Result<Tensor, TtsError> {
+        let text_ids = input_ids.i((.., 0, ..))?;
+        let text_embeds = self.text_embeddings.forward(&text_ids)?;
+
+        let shifted_audio_ids = input_ids
+            .broadcast_mul(&audio_mask_u32.unsqueeze(1)?)?
+            .broadcast_add(&self.codebook_layer_offsets)?;
+        let audio_embeds = self.audio_embeddings.forward(&shifted_audio_ids)?.sum(1)?;
+
+        let audio_mask = audio_mask_f32.to_dtype(text_embeds.dtype())?.unsqueeze(2)?;
+        let text_mask = audio_mask.neg()?.add(&Tensor::ones_like(&audio_mask)?)?;
+        Ok(text_embeds
+            .broadcast_mul(&text_mask)?
+            .add(&audio_embeds.broadcast_mul(&audio_mask)?)?)
+    }
+
+    /// One generation step's greedy picks on the GPU, as
+    /// [`super::burn_backbone::BurnBackbone::predict`] gives them, or `None`
+    /// when the backbone runs on candle. Each pass is (input_ids,
+    /// audio_mask_u32, audio_mask_f32, attention_mask) as for `forward`.
+    #[cfg(feature = "rocm")]
+    #[allow(clippy::type_complexity)]
+    fn predict_on_gpu(
+        &self,
+        cond: (&Tensor, &Tensor, &Tensor, Option<&Tensor>),
+        uncond: Option<(&Tensor, &Tensor, &Tensor, Option<&Tensor>)>,
+        logits_len: usize,
+        scale: f64,
+        penalty: &[f32],
+    ) -> Option<Result<(Vec<u32>, Vec<f32>), TtsError>> {
+        let burn = self.burn.as_ref()?;
+        let run = || {
+            let cond_hidden = self.embed(cond.0, cond.1, cond.2)?;
+            let uncond_hidden = uncond.map(|u| self.embed(u.0, u.1, u.2)).transpose()?;
+            burn.predict(
+                (&cond_hidden, cond.3.is_some()),
+                uncond_hidden.as_ref().zip(uncond).map(|(h, u)| (h, u.3.is_some())),
+                logits_len,
+                self.config.num_audio_codebook,
+                scale,
+                penalty,
+            )
+        };
+        Some(run())
     }
 }
 
@@ -807,59 +847,114 @@ impl OmniVoiceModel {
             )?
             .reshape((1, self.config.num_audio_codebook, cond_len))?;
             let backbone_started = std::time::Instant::now();
-            let cond_logits = self
-                .backbone
-                .lock()
-                .map_err(|_| {
-                    TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
-                })?
-                .forward(
-                    &cond_input_ids_tensor,
-                    &cond_audio_mask_u32,
-                    &cond_audio_mask_f32,
-                    cond_attention_mask.as_ref(),
-                    target_len,
-                )?
-                .to_dtype(DType::F32)?;
-            let u_logits =
-                if gen_config.guidance_scale != 0.0 {
-                    let uncond_input_ids_tensor =
+            // On ROCm, greedy picks are made on the GPU, so the logits (two
+            // 17 MB tensors a step for a 20 s chunk) never come back to the
+            // CPU. The debug dumps need the logits, so they take the CPU path.
+            #[cfg(feature = "rocm")]
+            let on_gpu = if gen_config.class_temperature <= 0.0
+                && std::env::var_os("OMNIVOICE_DEBUG_FIRST_STEP_DUMP").is_none()
+            {
+                let penalty = self.mask_token_penalty.flatten_all()?.to_vec1::<f32>()?;
+                let cond_ids = Tensor::new(cond_input_ids.as_slice(), &self.compute_device)?
+                    .reshape((1, self.config.num_audio_codebook, cond_len))?;
+                let uncond_ids = if gen_config.guidance_scale != 0.0 {
+                    Some(
                         Tensor::new(uncond_input_ids.as_slice(), &self.compute_device)?
-                            .reshape((1, self.config.num_audio_codebook, target_len))?;
-                    let logits = self
-                        .backbone
-                        .lock()
-                        .map_err(|_| {
-                            TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
-                        })?
-                        .forward(
-                            &uncond_input_ids_tensor,
-                            &uncond_audio_mask_u32,
-                            &uncond_audio_mask_f32,
-                            uncond_attention_mask.as_ref(),
-                            target_len,
-                        )?
-                        .to_dtype(DType::F32)?;
-                    Some(logits)
+                            .reshape((1, self.config.num_audio_codebook, target_len))?,
+                    )
                 } else {
                     None
                 };
-            BACKBONE_NANOS.fetch_add(
-                backbone_started.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            let (pred_tokens_flat, mut scores_flat) = self.predict_tokens_with_scoring(
-                &cond_logits,
-                u_logits.as_ref(),
-                gen_config,
-                &mut rng,
-            )?;
-            maybe_dump_debug_first_step(
-                &cond_logits,
-                u_logits.as_ref(),
-                &pred_tokens_flat,
-                &scores_flat,
-            )?;
+                let backbone = self.backbone.lock().map_err(|_| {
+                    TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
+                })?;
+                backbone.predict_on_gpu(
+                    (
+                        &cond_ids,
+                        &cond_audio_mask_u32,
+                        &cond_audio_mask_f32,
+                        cond_attention_mask.as_ref(),
+                    ),
+                    uncond_ids.as_ref().map(|ids| {
+                        (
+                            ids,
+                            &uncond_audio_mask_u32,
+                            &uncond_audio_mask_f32,
+                            uncond_attention_mask.as_ref(),
+                        )
+                    }),
+                    target_len,
+                    gen_config.guidance_scale,
+                    &penalty,
+                )
+                .transpose()?
+            } else {
+                None
+            };
+            #[cfg(not(feature = "rocm"))]
+            let on_gpu: Option<(Vec<u32>, Vec<f32>)> = None;
+            let (pred_tokens_flat, mut scores_flat) = if let Some(picks) = on_gpu {
+                BACKBONE_NANOS.fetch_add(
+                    backbone_started.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                picks
+            } else {
+                let cond_logits = self
+                    .backbone
+                    .lock()
+                    .map_err(|_| {
+                        TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
+                    })?
+                    .forward(
+                        &cond_input_ids_tensor,
+                        &cond_audio_mask_u32,
+                        &cond_audio_mask_f32,
+                        cond_attention_mask.as_ref(),
+                        target_len,
+                    )?
+                    .to_dtype(DType::F32)?;
+                let u_logits =
+                    if gen_config.guidance_scale != 0.0 {
+                        let uncond_input_ids_tensor =
+                            Tensor::new(uncond_input_ids.as_slice(), &self.compute_device)?
+                                .reshape((1, self.config.num_audio_codebook, target_len))?;
+                        let logits = self
+                            .backbone
+                            .lock()
+                            .map_err(|_| {
+                                TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
+                            })?
+                            .forward(
+                                &uncond_input_ids_tensor,
+                                &uncond_audio_mask_u32,
+                                &uncond_audio_mask_f32,
+                                uncond_attention_mask.as_ref(),
+                                target_len,
+                            )?
+                            .to_dtype(DType::F32)?;
+                        Some(logits)
+                    } else {
+                        None
+                    };
+                BACKBONE_NANOS.fetch_add(
+                    backbone_started.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                let (pred_tokens_flat, scores_flat) = self.predict_tokens_with_scoring(
+                    &cond_logits,
+                    u_logits.as_ref(),
+                    gen_config,
+                    &mut rng,
+                )?;
+                maybe_dump_debug_first_step(
+                    &cond_logits,
+                    u_logits.as_ref(),
+                    &pred_tokens_flat,
+                    &scores_flat,
+                )?;
+                (pred_tokens_flat, scores_flat)
+            };
             for (layer_scores, penalty) in scores_flat
                 .chunks_exact_mut(target_len)
                 .zip(layer_penalties.iter().copied())

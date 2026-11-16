@@ -289,8 +289,8 @@ mod tests {
             let options = AttentionModuleOptions { scale: None, softcap: None, is_causal: causal };
             let want = burn::tensor::module::attention(q.clone(), repeat(k.clone()), repeat(v.clone()), None, None, options);
             let got = attention(q.clone(), k.clone(), v.clone(), group, causal);
-            let want: Vec<f32> = want.into_data().to_vec().unwrap();
-            let got: Vec<f32> = got.into_data().to_vec().unwrap();
+            let want: Vec<f32> = want.into_data().try_to_vec::<f32>().unwrap();
+            let got: Vec<f32> = got.into_data().try_to_vec::<f32>().unwrap();
             let diff = want.iter().zip(&got).fold(0.0f32, |d, (a, b)| d.max((a - b).abs()));
             assert!(diff < 1e-5, "causal {causal}: max |diff| {diff}");
         }

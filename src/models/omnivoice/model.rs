@@ -290,6 +290,9 @@ pub struct OmniVoiceModel {
     causal_mask_cache: Mutex<HashMap<usize, Tensor>>,
     audio_tokenizer_config: OmniVoiceAudioTokenizerConfig,
     audio_tokenizer: OmniVoiceAudioTokenizerDecoder,
+    /// The audio decoder on the GPU, used instead of `audio_tokenizer` on ROCm.
+    #[cfg(feature = "rocm")]
+    burn_audio_decoder: Option<super::burn_audio_decoder::BurnAudioDecoder>,
     voice_prompt: Mutex<Option<Arc<VoicePrompt>>>,
     mask_token_penalty: Tensor,
 }
@@ -358,7 +361,7 @@ impl TtsModel for OmniVoiceModel {
             &compute_device,
             compute_dtype,
             #[cfg(feature = "rocm")]
-            burn_device,
+            burn_device.clone(),
         )?;
 
         let audio_device = if matches!(compute_device, Device::Metal(_)) {
@@ -372,6 +375,17 @@ impl TtsModel for OmniVoiceModel {
             DType::F32,
             &audio_device,
         )?;
+        #[cfg(feature = "rocm")]
+        let burn_audio_decoder = burn_device
+            .map(|device| {
+                super::burn_audio_decoder::BurnAudioDecoder::load(
+                    &audio_tokenizer_config,
+                    model_config.num_audio_codebook,
+                    &audio_vb,
+                    device,
+                )
+            })
+            .transpose()?;
         let audio_tokenizer = OmniVoiceAudioTokenizerDecoder::load(
             &audio_tokenizer_config,
             model_config.num_audio_codebook,
@@ -390,7 +404,7 @@ impl TtsModel for OmniVoiceModel {
             "Loading OmniVoice on {:?} (audio decoder on {:?}){}",
             compute_device,
             audio_device,
-            if on_burn { ", backbone on ROCm through burn" } else { "" }
+            if on_burn { ", backbone and audio decoder on ROCm through burn" } else { "" }
         );
 
         Ok(Self {
@@ -405,6 +419,8 @@ impl TtsModel for OmniVoiceModel {
             causal_mask_cache: Mutex::new(HashMap::new()),
             audio_tokenizer_config,
             audio_tokenizer,
+            #[cfg(feature = "rocm")]
+            burn_audio_decoder,
             voice_prompt: Mutex::new(None),
             mask_token_penalty,
         })
@@ -898,6 +914,11 @@ impl OmniVoiceModel {
 
         let mut audio_chunks = Vec::with_capacity(token_chunks.len());
         for chunk in token_chunks {
+            #[cfg(feature = "rocm")]
+            if let Some(decoder) = &self.burn_audio_decoder {
+                audio_chunks.push(decoder.decode(&chunk.tokens, chunk.len)?);
+                continue;
+            }
             let token_tensor = Tensor::new(chunk.tokens.as_slice(), &self.audio_device)?
                 .reshape((1, self.config.num_audio_codebook, chunk.len))?;
             let waveform = self.audio_tokenizer.decode(&token_tensor)?;

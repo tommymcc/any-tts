@@ -11,6 +11,8 @@ mod audio_encoder;
 mod audio_processing;
 mod audio_tokenizer;
 #[cfg(feature = "rocm")]
+mod burn_audio_decoder;
+#[cfg(feature = "rocm")]
 mod burn_backbone;
 mod config;
 pub mod model;

@@ -287,35 +287,70 @@ impl OmniVoiceBackbone {
             .add(&audio_embeds.broadcast_mul(&audio_mask)?)?)
     }
 
-    /// One generation step's greedy picks on the GPU, as
-    /// [`super::burn_backbone::BurnBackbone::predict`] gives them, or `None`
-    /// when the backbone runs on candle. Each pass is (input_ids,
-    /// audio_mask_u32, audio_mask_f32, attention_mask) as for `forward`.
+    /// The fixed parts of a chunk's conditional and (with guidance)
+    /// unconditional passes on the GPU, for [`Self::predict_on_gpu`], or
+    /// `None` when the backbone runs on candle. The text embeddings are summed
+    /// here once; the unconditional pass is all audio, so it has none. Each
+    /// pass is (input_ids, audio_mask, attention_mask) as for `forward`.
     #[cfg(feature = "rocm")]
-    #[allow(clippy::type_complexity)]
-    fn predict_on_gpu(
+    fn prepare_gpu_passes(
         &self,
-        cond: (&Tensor, &Tensor, &Tensor, Option<&Tensor>),
-        uncond: Option<(&Tensor, &Tensor, &Tensor, Option<&Tensor>)>,
-        logits_len: usize,
-        scale: f64,
-        penalty: &[f32],
-    ) -> Option<Result<(Vec<u32>, Vec<f32>), TtsError>> {
+        cond: (&Tensor, &[u32], Option<&Tensor>),
+        uncond: Option<(&[u32], Option<&Tensor>)>,
+    ) -> Option<Result<GpuPasses, TtsError>> {
         let burn = self.burn.as_ref()?;
         let run = || {
-            let cond_hidden = self.embed(cond.0, cond.1, cond.2)?;
-            let uncond_hidden = uncond.map(|u| self.embed(u.0, u.1, u.2)).transpose()?;
-            burn.predict(
-                (&cond_hidden, cond.3.is_some()),
-                uncond_hidden.as_ref().zip(uncond).map(|(h, u)| (h, u.3.is_some())),
-                logits_len,
-                self.config.num_audio_codebook,
-                scale,
-                penalty,
-            )
+            let (input_ids, audio_mask, attention_mask) = cond;
+            let text_ids = input_ids.i((.., 0, ..))?;
+            let text_embeds = self.text_embeddings.forward(&text_ids)?;
+            let text_mask: Vec<f32> = audio_mask.iter().map(|&m| if m == 0 { 1.0 } else { 0.0 }).collect();
+            let text_mask = Tensor::from_vec(text_mask, (1, audio_mask.len(), 1), text_embeds.device())?
+                .to_dtype(text_embeds.dtype())?;
+            let text = text_embeds.broadcast_mul(&text_mask)?;
+            Ok(GpuPasses {
+                cond: burn.prepare_pass(Some(&text), audio_mask, attention_mask.is_some())?,
+                uncond: uncond
+                    .map(|(audio_mask, attention_mask)| {
+                        burn.prepare_pass(None, audio_mask, attention_mask.is_some())
+                    })
+                    .transpose()?,
+            })
         };
         Some(run())
     }
+
+    /// One generation step's greedy picks on the GPU, as
+    /// [`super::burn_backbone::BurnBackbone::predict`] gives them, from the
+    /// step's audio ids, (codebooks, seq) codebook-major, for each pass.
+    #[cfg(feature = "rocm")]
+    fn predict_on_gpu(
+        &self,
+        passes: &GpuPasses,
+        cond_ids: &[u32],
+        uncond_ids: &[u32],
+        logits_len: usize,
+        scale: f64,
+        penalty: &[f32],
+    ) -> Result<(Vec<u32>, Vec<f32>), TtsError> {
+        let burn = self.burn.as_ref().ok_or_else(|| {
+            TtsError::RuntimeError("OmniVoice's backbone isn't on the GPU".to_string())
+        })?;
+        burn.predict(
+            (&passes.cond, cond_ids),
+            passes.uncond.as_ref().map(|pass| (pass, uncond_ids)),
+            logits_len,
+            self.config.num_audio_codebook,
+            scale,
+            penalty,
+        )
+    }
+}
+
+/// See [`OmniVoiceBackbone::prepare_gpu_passes`].
+#[cfg(feature = "rocm")]
+struct GpuPasses {
+    cond: super::burn_backbone::PassInputs,
+    uncond: Option<super::burn_backbone::PassInputs>,
 }
 
 pub struct OmniVoiceModel {
@@ -836,6 +871,36 @@ impl OmniVoiceModel {
             .collect();
         let mut step_trace = Vec::new();
 
+        #[cfg(feature = "rocm")]
+        let gpu_passes = if gen_config.class_temperature <= 0.0
+            && std::env::var_os("OMNIVOICE_DEBUG_FIRST_STEP_DUMP").is_none()
+        {
+            let started = std::time::Instant::now();
+            let cond_ids = Tensor::new(cond_input_ids.as_slice(), &self.compute_device)?
+                .reshape((1, self.config.num_audio_codebook, cond_len))?;
+            let uncond_audio_mask = vec![1u32; target_len];
+            let passes = self
+                .backbone
+                .lock()
+                .map_err(|_| {
+                    TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
+                })?
+                .prepare_gpu_passes(
+                    (&cond_ids, &cond_audio_mask_u32_values, cond_attention_mask.as_ref()),
+                    (gen_config.guidance_scale != 0.0)
+                        .then_some((uncond_audio_mask.as_slice(), uncond_attention_mask.as_ref())),
+                )
+                .transpose()?;
+            BACKBONE_NANOS.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let penalty = self.mask_token_penalty.flatten_all()?.to_vec1::<f32>()?;
+            passes.map(|passes| (passes, penalty))
+        } else {
+            None
+        };
+
         for (step_index, step_k) in schedule.iter().copied().enumerate() {
             if step_k == 0 {
                 continue;
@@ -851,45 +916,23 @@ impl OmniVoiceModel {
             // 17 MB tensors a step for a 20 s chunk) never come back to the
             // CPU. The debug dumps need the logits, so they take the CPU path.
             #[cfg(feature = "rocm")]
-            let on_gpu = if gen_config.class_temperature <= 0.0
-                && std::env::var_os("OMNIVOICE_DEBUG_FIRST_STEP_DUMP").is_none()
-            {
-                let penalty = self.mask_token_penalty.flatten_all()?.to_vec1::<f32>()?;
-                let cond_ids = Tensor::new(cond_input_ids.as_slice(), &self.compute_device)?
-                    .reshape((1, self.config.num_audio_codebook, cond_len))?;
-                let uncond_ids = if gen_config.guidance_scale != 0.0 {
-                    Some(
-                        Tensor::new(uncond_input_ids.as_slice(), &self.compute_device)?
-                            .reshape((1, self.config.num_audio_codebook, target_len))?,
-                    )
-                } else {
-                    None
-                };
-                let backbone = self.backbone.lock().map_err(|_| {
-                    TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
-                })?;
-                backbone.predict_on_gpu(
-                    (
-                        &cond_ids,
-                        &cond_audio_mask_u32,
-                        &cond_audio_mask_f32,
-                        cond_attention_mask.as_ref(),
-                    ),
-                    uncond_ids.as_ref().map(|ids| {
-                        (
-                            ids,
-                            &uncond_audio_mask_u32,
-                            &uncond_audio_mask_f32,
-                            uncond_attention_mask.as_ref(),
-                        )
-                    }),
-                    target_len,
-                    gen_config.guidance_scale,
-                    &penalty,
-                )
-                .transpose()?
-            } else {
-                None
+            let on_gpu = match &gpu_passes {
+                Some((passes, penalty)) => Some(
+                    self.backbone
+                        .lock()
+                        .map_err(|_| {
+                            TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
+                        })?
+                        .predict_on_gpu(
+                            passes,
+                            &cond_input_ids,
+                            &uncond_input_ids,
+                            target_len,
+                            gen_config.guidance_scale,
+                            penalty,
+                        )?,
+                ),
+                None => None,
             };
             #[cfg(not(feature = "rocm"))]
             let on_gpu: Option<(Vec<u32>, Vec<f32>)> = None;

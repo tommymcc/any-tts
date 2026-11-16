@@ -1,15 +1,18 @@
 //! OmniVoice's transformer layers, final norm and audio head on burn, for AMD
 //! GPUs through ROCm (`rocm` feature).
 //!
-//! The embeddings stay on candle's CPU device, which keeps the 620 MB text
-//! embedding table out of VRAM: [`super::model`] sums them as before and hands
-//! the hidden states here. Each layer matches [`crate::layers::TransformerBlock`]
+//! The text embeddings stay on candle's CPU device, which keeps the 620 MB
+//! text embedding table out of VRAM. The text part of a pass doesn't change
+//! between generation steps, so [`super::model`] computes it once per chunk
+//! and hands it to [`BurnBackbone::prepare_pass`]. The audio embeddings (33 MB)
+//! live here: they change every step, and summing them on the CPU took a tenth
+//! of each step. Each layer matches [`crate::layers::TransformerBlock`]
 //! with fused kernels: pre-norm, grouped-query attention with a per-head RMSNorm
 //! on Q and K and split-half RoPE, and a SiLU MLP. Weights run in F32.
 
 use burn::tensor::activation::{log_softmax, silu};
 use burn::tensor::module::linear;
-use burn::tensor::{Bool, Device, Tensor, TensorData};
+use burn::tensor::{Bool, Device, Int, Tensor, TensorData};
 use candle_core::DType;
 use candle_nn::VarBuilder;
 
@@ -25,6 +28,8 @@ pub(super) struct BurnBackbone {
     norm: Tensor<1>,
     /// The audio head, (hidden, codebooks * audio_vocab).
     head: Tensor<2>,
+    /// (codebooks * audio_vocab, hidden): one table per codebook, stacked.
+    audio_embeddings: Tensor<2>,
     /// RoPE tables, (max_positions, head_dim / 2).
     rope_cos: Tensor<2>,
     rope_sin: Tensor<2>,
@@ -52,6 +57,16 @@ struct Layer {
     gate: Tensor<2>,
     up: Tensor<2>,
     down: Tensor<2>,
+}
+
+/// One pass's inputs that stay fixed through a chunk's generation steps; see
+/// [`BurnBackbone::prepare_pass`].
+pub(super) struct PassInputs {
+    text: Option<Tensor<3>>,
+    /// (1, seq, 1): 1 at audio positions.
+    audio_mask: Tensor<3>,
+    audio_positions: Vec<u32>,
+    causal: bool,
 }
 
 impl BurnBackbone {
@@ -105,6 +120,8 @@ impl BurnBackbone {
             }
             let norm = vector(vb, "llm.norm", hidden)?;
             let head = matrix(vb, "audio_heads", head_size, hidden)?;
+            // Looked up by row, so not transposed.
+            let audio_embeddings = matrix(vb, "audio_embeddings", head_size, hidden)?.transpose();
             let (cos, sin) = precompute_rope_half_freqs(
                 shape.head_dim,
                 llm.max_position_embeddings,
@@ -122,6 +139,7 @@ impl BurnBackbone {
                 layers,
                 norm,
                 head,
+                audio_embeddings,
                 rope_cos: table(cos)?,
                 rope_sin: table(sin)?,
                 shape,
@@ -164,6 +182,58 @@ impl BurnBackbone {
         )?)
     }
 
+    /// The parts of one pass's input that stay fixed through a chunk's
+    /// generation steps, copied to the GPU once: `text`, (1, seq, hidden) on
+    /// the CPU, is the text embeddings already zeroed at audio positions (or
+    /// `None` where every position is audio), and `audio_mask` marks the audio
+    /// positions. Attention sees every position unless `causal`.
+    pub(super) fn prepare_pass(
+        &self,
+        text: Option<&candle_core::Tensor>,
+        audio_mask: &[u32],
+        causal: bool,
+    ) -> Result<PassInputs, TtsError> {
+        let seq = audio_mask.len();
+        let text = text.map(|t| self.upload(t)).transpose()?;
+        let mask: Vec<f32> = audio_mask.iter().map(|&m| m as f32).collect();
+        let audio_mask_gpu = guard("copying the audio mask to the GPU", || {
+            Tensor::<3>::from_data(TensorData::new(mask, [1, seq, 1]), &self.device)
+        })
+        .map_err(TtsError::RuntimeError)?;
+        Ok(PassInputs { text, audio_mask: audio_mask_gpu, audio_positions: audio_mask.to_vec(), causal })
+    }
+
+    /// The hidden states, (1, seq, hidden), for one pass at the current step:
+    /// the text part plus, at audio positions, the sum over codebooks of each
+    /// codebook's embedding of `ids`, (codebooks, seq) codebook-major.
+    fn embed(&self, pass: &PassInputs, ids: &[u32], codebooks: usize, vocab: usize) -> Tensor<3> {
+        let seq = pass.audio_positions.len();
+        // Text positions look up row 0 of each codebook's table, which the
+        // mask then zeroes, as candle's embedding does.
+        let rows: Vec<i32> = ids
+            .chunks_exact(seq)
+            .enumerate()
+            .flat_map(|(codebook, ids)| {
+                ids.iter()
+                    .zip(&pass.audio_positions)
+                    .map(move |(&id, &audio)| (id * audio) as i32 + (codebook * vocab) as i32)
+            })
+            .collect();
+        let rows = Tensor::<1, Int>::from_data(TensorData::new(rows, [codebooks * seq]), &self.device);
+        let [_, hidden] = self.audio_embeddings.dims();
+        let audio = self
+            .audio_embeddings
+            .clone()
+            .select(0, rows)
+            .reshape([codebooks, seq, hidden])
+            .sum_dim(0)
+            * pass.audio_mask.clone();
+        match &pass.text {
+            Some(text) => text.clone() + audio,
+            None => audio,
+        }
+    }
+
     /// One generation step's greedy picks, without bringing the logits back to
     /// the CPU: runs the conditional pass (and the unconditional one, for
     /// classifier-free guidance at `scale`), takes log-softmax over each
@@ -171,11 +241,12 @@ impl BurnBackbone {
     /// log_softmax(c + scale (c - u)), adds `penalty` (one value per vocabulary
     /// entry), and returns each (codebook, position)'s best token and its
     /// log-probability, codebook-major, for the last `logits_len` positions.
-    /// Each pass is (hidden, causal); hidden is (1, seq, hidden) F32 on the CPU.
+    /// Each pass is its fixed inputs and the step's audio ids, (codebooks,
+    /// seq) codebook-major.
     pub(super) fn predict(
         &self,
-        cond: (&candle_core::Tensor, bool),
-        uncond: Option<(&candle_core::Tensor, bool)>,
+        cond: (&PassInputs, &[u32]),
+        uncond: Option<(&PassInputs, &[u32])>,
         logits_len: usize,
         codebooks: usize,
         scale: f64,
@@ -183,17 +254,19 @@ impl BurnBackbone {
     ) -> Result<(Vec<u32>, Vec<f32>), TtsError> {
         let started = std::time::Instant::now();
         let vocab = penalty.len();
-        let cond_input = self.upload(cond.0)?;
-        let uncond_input = uncond.map(|(hidden, causal)| self.upload(hidden).map(|t| (t, causal))).transpose()?;
         let penalty = penalty.to_vec();
         let run = || -> Result<(Vec<u32>, Vec<f32>), String> {
             let log_probs = |logits: Tensor<3>| {
                 log_softmax(logits.reshape([logits_len, codebooks, vocab]).swap_dims(0, 1), 2)
             };
-            let c = log_probs(self.logits(cond_input, logits_len, cond.1));
-            let guided = match uncond_input {
-                Some((input, causal)) => {
-                    let u = log_probs(self.logits(input, logits_len, causal));
+            let pass = |(inputs, ids): (&PassInputs, &[u32])| {
+                let hidden = self.embed(inputs, ids, codebooks, vocab);
+                log_probs(self.logits(hidden, logits_len, inputs.causal))
+            };
+            let c = pass(cond);
+            let guided = match uncond {
+                Some(uncond) => {
+                    let u = pass(uncond);
                     log_softmax(c.clone() + (c - u).mul_scalar(scale), 2)
                 }
                 None => c,
@@ -212,8 +285,8 @@ impl BurnBackbone {
         if std::env::var_os("OMNIVOICE_TIMINGS").is_some() {
             eprintln!(
                 "omnivoice timing: burn step seq {}{} logits {logits_len}: total {:.3}s",
-                cond.0.dim(1)?,
-                uncond.map(|(h, _)| h.dim(1).map(|s| format!(" + {s}")).unwrap_or_default()).unwrap_or_default(),
+                cond.0.audio_positions.len(),
+                uncond.map(|(p, _)| format!(" + {}", p.audio_positions.len())).unwrap_or_default(),
                 started.elapsed().as_secs_f64()
             );
         }

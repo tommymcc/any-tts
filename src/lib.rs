@@ -20,6 +20,7 @@
 //! - `cuda` — Enable CUDA GPU acceleration
 //! - `metal` — Enable Metal GPU acceleration (macOS/iOS)
 //! - `accelerate` — Enable Apple Accelerate framework
+//! - `rocm` — Run OmniVoice's transformer backbone on AMD GPUs through burn's ROCm backend
 //! - `kokoro` — Build Kokoro model support (default)
 //! - `omnivoice` — Build native OmniVoice support (default)
 //! - `qwen3-tts` — Build Qwen3-TTS model support (default)
@@ -48,6 +49,8 @@
 //! ```
 
 pub mod audio;
+#[cfg(feature = "rocm")]
+pub mod burn_device;
 pub mod config;
 pub mod device;
 pub mod error;

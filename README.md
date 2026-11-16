@@ -104,6 +104,7 @@ By default the crate enables `qwen3-tts`, `kokoro`, `omnivoice`, `vibevoice`, `v
 | `cuda` | Builds Candle with CUDA support. |
 | `metal` | Builds Candle with Metal support for Apple GPUs. |
 | `accelerate` | Enables Apple Accelerate support for CPU-heavy Apple builds. |
+| `rocm` | Runs OmniVoice's transformer backbone on an AMD GPU with [burn](https://burn.dev)'s ROCm backend, and the rest on the CPU. Select it with `DeviceSelection::Rocm(0)`, or `Auto` picks it after CUDA and Metal. Needs ROCm's HIP 7.1 at run time and Rust 1.92+ to build. A crate using it needs the `[patch.crates-io]` entries in this crate's `Cargo.toml` (gemm, pliron, cubecl-hip-sys forks) for CPUs without AVX2 and for Ubuntu's HIP. `OMNIVOICE_TIMINGS=1` prints where `synthesize` spends its time. |
 
 ### Backend selection
 

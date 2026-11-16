@@ -110,6 +110,10 @@ impl<'a> From<&'a VoicePrompt> for PromptView<'a> {
 
 struct OmniVoiceBackbone {
     config: OmniVoiceConfig,
+    /// The layers, norm and head on an AMD GPU, in place of `layers`, `norm`
+    /// and `audio_head`.
+    #[cfg(feature = "rocm")]
+    burn: Option<super::burn_backbone::BurnBackbone>,
     text_embeddings: Embedding,
     audio_embeddings: Embedding,
     audio_head: Linear,
@@ -126,8 +130,24 @@ impl OmniVoiceBackbone {
         vb: candle_nn::VarBuilder,
         device: &Device,
         dtype: DType,
+        #[cfg(feature = "rocm")] burn_device: Option<burn::tensor::Device>,
     ) -> Result<Self, TtsError> {
         let llm = &config.llm_config;
+        #[cfg(feature = "rocm")]
+        let burn = burn_device
+            .map(|burn_device| {
+                super::burn_backbone::BurnBackbone::load(
+                    llm,
+                    config.num_audio_codebook * config.audio_vocab_size,
+                    &vb,
+                    burn_device,
+                )
+            })
+            .transpose()?;
+        #[cfg(feature = "rocm")]
+        let on_burn = burn.is_some();
+        #[cfg(not(feature = "rocm"))]
+        let on_burn = false;
         let gqa_config = GqaConfig::with_head_dim(
             llm.hidden_size,
             llm.num_attention_heads,
@@ -154,8 +174,10 @@ impl OmniVoiceBackbone {
         let norm = RmsNorm::load(llm.hidden_size, llm.rms_norm_eps, vb.pp("llm.norm"))?
             .with_kernels(KernelMode::Fused);
 
-        let mut layers = Vec::with_capacity(llm.num_hidden_layers);
-        for layer_index in 0..llm.num_hidden_layers {
+        // On the GPU through burn, candle keeps only the embeddings.
+        let candle_layers = if on_burn { 0 } else { llm.num_hidden_layers };
+        let mut layers = Vec::with_capacity(candle_layers);
+        for layer_index in 0..candle_layers {
             layers.push(TransformerBlock::load(
                 &gqa_config,
                 llm.intermediate_size,
@@ -180,6 +202,8 @@ impl OmniVoiceBackbone {
 
         Ok(Self {
             config: config.clone(),
+            #[cfg(feature = "rocm")]
+            burn,
             text_embeddings,
             audio_embeddings,
             audio_head,
@@ -215,6 +239,21 @@ impl OmniVoiceBackbone {
             .broadcast_mul(&text_mask)?
             .add(&audio_embeds.broadcast_mul(&audio_mask)?)?;
 
+        #[cfg(feature = "rocm")]
+        if let Some(burn) = &self.burn {
+            // The only mask OmniVoice builds is the causal one.
+            let logits_flat = burn.forward(&hidden, logits_len, attention_mask.is_some())?;
+            let batch = hidden.dim(0)?;
+            return logits_flat
+                .reshape((
+                    batch,
+                    logits_len,
+                    self.config.num_audio_codebook,
+                    self.config.audio_vocab_size,
+                ))?
+                .transpose(1, 2)
+                .map_err(Into::into);
+        }
         for layer in &self.layers {
             hidden =
                 layer.forward_uncached(&hidden, &self.rope_cos, &self.rope_sin, attention_mask)?;
@@ -258,8 +297,23 @@ pub struct OmniVoiceModel {
 impl TtsModel for OmniVoiceModel {
     fn load(config: TtsConfig) -> Result<Self, TtsError> {
         let compute_device = config.device.resolve()?;
+        #[cfg(feature = "rocm")]
+        let burn_device = match config.device.concrete() {
+            crate::device::DeviceSelection::Rocm(ordinal) => Some(
+                crate::burn_device::rocm_device(ordinal).map_err(TtsError::ModelError)?,
+            ),
+            _ => None,
+        };
+        #[cfg(feature = "rocm")]
+        let on_burn = burn_device.is_some();
+        #[cfg(not(feature = "rocm"))]
+        let on_burn = false;
         let dtype_override = env_override_dtype("OMNIVOICE_DTYPE");
         let mut compute_dtype = dtype_override.unwrap_or_else(|| config.dtype.to_candle());
+        if on_burn && compute_dtype != DType::F32 {
+            info!("OmniVoice's backbone runs in F32 on ROCm, and the rest on the CPU");
+            compute_dtype = DType::F32;
+        }
         if matches!(compute_device, Device::Cpu) && compute_dtype == DType::BF16 {
             info!("BF16 is not supported on CPU; falling back to F32 for OmniVoice");
             compute_dtype = DType::F32;
@@ -298,8 +352,14 @@ impl TtsModel for OmniVoiceModel {
 
         let main_vb =
             ModelFiles::load_safetensors_vb(&files.weights, compute_dtype, &compute_device)?;
-        let backbone =
-            OmniVoiceBackbone::load(&model_config, main_vb, &compute_device, compute_dtype)?;
+        let backbone = OmniVoiceBackbone::load(
+            &model_config,
+            main_vb,
+            &compute_device,
+            compute_dtype,
+            #[cfg(feature = "rocm")]
+            burn_device,
+        )?;
 
         let audio_device = if matches!(compute_device, Device::Metal(_)) {
             Device::Cpu
@@ -327,8 +387,10 @@ impl TtsModel for OmniVoiceModel {
             .reshape((1, 1, 1, model_config.audio_vocab_size))?;
 
         info!(
-            "Loading OmniVoice on {:?} (audio decoder on {:?})",
-            compute_device, audio_device
+            "Loading OmniVoice on {:?} (audio decoder on {:?}){}",
+            compute_device,
+            audio_device,
+            if on_burn { ", backbone on ROCm through burn" } else { "" }
         );
 
         Ok(Self {
@@ -378,11 +440,13 @@ impl TtsModel for OmniVoiceModel {
         let gen_config = OmniVoiceGenerationConfig::from_request(request);
         let normalized_language = self.normalize_language(request.language.as_deref());
         let normalized_instruct = normalize_instruct(request.instruct.as_deref(), &request.text);
+        let timer = PhaseTimer::from_env();
         let prompt = request
             .reference_audio
             .as_ref()
             .map(|reference| self.prepare_voice(reference))
             .transpose()?;
+        timer.lap("prepare voice");
         let view = prompt.as_deref().map(PromptView::from).unwrap_or_default();
         let target_len = request.max_tokens.unwrap_or_else(|| {
             estimate_target_tokens_with_reference(
@@ -401,7 +465,9 @@ impl TtsModel for OmniVoiceModel {
             view,
             speed,
         )?;
+        timer.lap("generate tokens");
         let samples = self.decode_token_chunks(&token_chunks)?;
+        timer.lap("decode audio");
         let samples = post_process_audio(
             &samples,
             self.sample_rate(),
@@ -724,6 +790,7 @@ impl OmniVoiceModel {
                 &self.compute_device,
             )?
             .reshape((1, self.config.num_audio_codebook, cond_len))?;
+            let backbone_started = std::time::Instant::now();
             let cond_logits = self
                 .backbone
                 .lock()
@@ -761,6 +828,10 @@ impl OmniVoiceModel {
                 } else {
                     None
                 };
+            BACKBONE_NANOS.fetch_add(
+                backbone_started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let (pred_tokens_flat, mut scores_flat) = self.predict_tokens_with_scoring(
                 &cond_logits,
                 u_logits.as_ref(),
@@ -1109,6 +1180,38 @@ fn env_override_dtype(name: &str) -> Option<DType> {
         "f16" => Some(DType::F16),
         "bf16" => Some(DType::BF16),
         _ => None,
+    }
+}
+
+/// Time spent in the backbone's forward passes, for `OMNIVOICE_TIMINGS`.
+static BACKBONE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Prints how long each phase of `synthesize` took when `OMNIVOICE_TIMINGS` is
+/// set, with the backbone's share of generating tokens.
+struct PhaseTimer {
+    last: Option<std::cell::Cell<std::time::Instant>>,
+}
+
+impl PhaseTimer {
+    fn from_env() -> Self {
+        let enabled = std::env::var_os("OMNIVOICE_TIMINGS").is_some();
+        if enabled {
+            BACKBONE_NANOS.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        Self { last: enabled.then(|| std::cell::Cell::new(std::time::Instant::now())) }
+    }
+
+    fn lap(&self, phase: &str) {
+        let Some(last) = &self.last else { return };
+        let now = std::time::Instant::now();
+        let took = now.duration_since(last.get()).as_secs_f64();
+        last.set(now);
+        if phase == "generate tokens" {
+            let backbone = BACKBONE_NANOS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+            eprintln!("omnivoice timing: {phase} {took:.2}s (backbone {backbone:.2}s)");
+        } else {
+            eprintln!("omnivoice timing: {phase} {took:.2}s");
+        }
     }
 }
 

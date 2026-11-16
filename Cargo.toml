@@ -75,6 +75,10 @@ default = ["qwen3-tts", "kokoro", "omnivoice", "vibevoice", "voxtral", "download
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+# AMD GPUs through burn's ROCm backend. OmniVoice runs its transformer backbone
+# there and everything else on candle's CPU device. Needs ROCm (HIP 7.1) at run
+# time, and Rust 1.92+ to build.
+rocm = ["dep:burn", "burn/rocm", "burn/cubecl", "dep:burn-core", "omnivoice"]
 qwen3-tts = []
 kokoro = ["dep:kana2phone", "dep:lindera", "dep:pinyin", "dep:fancy-regex", "dep:unicode-normalization"]
 omnivoice = ["dep:unicode-general-category"]
@@ -83,6 +87,11 @@ voxtral = []
 download = ["dep:reqwest"]
 
 [dependencies]
+# For the `rocm` feature. The same burn as parakeet-rs 0.4.4 pins.
+burn = { version = "=0.22.0", optional = true, default-features = false, features = ["std"] }
+# Only for its `persistence` feature, which burn doesn't forward: CubeCL can cache
+# compiled kernels on disk only with it.
+burn-core = { version = "0.22", optional = true, default-features = false, features = ["persistence"] }
 fancy-regex = { version = "0.17", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 unicode-general-category = { version = "1", optional = true }
@@ -110,3 +119,13 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 hound = "3.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
+
+# Fixes from forks, for building this crate on its own; a crate that depends on
+# any-tts needs its own copies. gemm 0.19 panics on CPUs with FMA but no AVX2;
+# pliron 0.19 (under burn) can resolve to a hashbrown too old to build with;
+# cubecl-hip-sys has no bindings for Ubuntu 26.04's HIP (52801).
+[patch.crates-io]
+gemm-common = { git = "https://github.com/tommymcc/gemm", rev = "dbdcb05011089a25f1b4d34e89eee4504b61f605" }
+gemm-f16 = { git = "https://github.com/tommymcc/gemm", rev = "dbdcb05011089a25f1b4d34e89eee4504b61f605" }
+pliron = { git = "https://github.com/tommymcc/pliron", rev = "ac2cc0c820907013df7d955be7da370a7b8b2c2f" }
+cubecl-hip-sys = { git = "https://github.com/tommymcc/cubecl-hip-sys", rev = "26e8dea1b9ae2a362f28ed2aadf67f25d2022acb" }

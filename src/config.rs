@@ -1265,30 +1265,36 @@ fn preferred_dtype_for(model_type: ModelType, device: DeviceSelection) -> DType 
             DeviceSelection::Cpu => DType::F32,
             DeviceSelection::Cuda(_) => DType::F16,
             DeviceSelection::Metal(_) => DType::F32,
+            // The backbone runs in F32 on burn, the rest on candle's CPU.
+            DeviceSelection::Rocm(_) => DType::F32,
             DeviceSelection::Auto => DType::F16,
         },
         ModelType::Kokoro => match device {
             DeviceSelection::Cpu => DType::F32,
             DeviceSelection::Cuda(_) => DType::BF16,
             DeviceSelection::Metal(_) => DType::F32,
+            DeviceSelection::Rocm(_) => DType::F32,
             DeviceSelection::Auto => DType::BF16,
         },
         ModelType::Qwen3Tts => match device {
             DeviceSelection::Cpu => DType::F32,
             DeviceSelection::Cuda(_) => DType::BF16,
             DeviceSelection::Metal(_) => DType::BF16,
+            DeviceSelection::Rocm(_) => DType::F32,
             DeviceSelection::Auto => DType::BF16,
         },
         ModelType::VibeVoice | ModelType::VibeVoiceRealtime => match device {
             DeviceSelection::Cpu => DType::F32,
             DeviceSelection::Cuda(_) => DType::BF16,
             DeviceSelection::Metal(_) => DType::F32,
+            DeviceSelection::Rocm(_) => DType::F32,
             DeviceSelection::Auto => DType::BF16,
         },
         ModelType::Voxtral => match device {
             DeviceSelection::Cpu => DType::F32,
             DeviceSelection::Cuda(_) => DType::BF16,
             DeviceSelection::Metal(_) => DType::F32,
+            DeviceSelection::Rocm(_) => DType::F32,
             DeviceSelection::Auto => DType::BF16,
         },
     }

@@ -10,6 +10,8 @@ use crate::models::ModelType;
 mod audio_encoder;
 mod audio_processing;
 mod audio_tokenizer;
+#[cfg(feature = "rocm")]
+mod burn_backbone;
 mod config;
 pub mod model;
 

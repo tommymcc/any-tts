@@ -9,7 +9,7 @@ use tracing::info;
 /// Strategy for selecting a compute device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceSelection {
-    /// Automatically select the best available device (CUDA → Metal → CPU).
+    /// Automatically select the best available device (CUDA → Metal → ROCm → CPU).
     #[default]
     Auto,
     /// Force CPU execution.
@@ -18,6 +18,10 @@ pub enum DeviceSelection {
     Cuda(usize),
     /// Force Metal execution on the specified GPU ordinal.
     Metal(usize),
+    /// An AMD GPU through burn's ROCm backend (`rocm` feature), for the models
+    /// that support it (OmniVoice's backbone). candle runs on the CPU, so this
+    /// resolves to the CPU device, and models without ROCm support run there.
+    Rocm(usize),
 }
 
 impl DeviceSelection {
@@ -41,6 +45,10 @@ impl DeviceSelection {
                 info!("Requesting Metal device {}", ordinal);
                 new_metal(*ordinal)
             }
+            Self::Rocm(ordinal) => {
+                info!("Requesting ROCm device {}", ordinal);
+                new_rocm(*ordinal)
+            }
             Self::Auto => auto_select(),
         }
     }
@@ -52,6 +60,7 @@ impl DeviceSelection {
             Self::Cpu => "cpu".to_string(),
             Self::Cuda(ordinal) => format!("cuda:{ordinal}"),
             Self::Metal(ordinal) => format!("metal:{ordinal}"),
+            Self::Rocm(ordinal) => format!("rocm:{ordinal}"),
         }
     }
 
@@ -62,8 +71,22 @@ impl DeviceSelection {
             Self::Cuda(0),
             #[cfg(feature = "metal")]
             Self::Metal(0),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(0),
             Self::Cpu,
         ]
+    }
+
+    /// The selection that [`Self::Auto`] settles on, the first candidate that
+    /// resolves on this machine. Other selections are returned unchanged.
+    pub fn concrete(&self) -> Self {
+        match self {
+            Self::Auto => Self::available_runtime_candidates()
+                .first()
+                .copied()
+                .unwrap_or(Self::Cpu),
+            other => *other,
+        }
     }
 
     /// Runtime candidates that successfully resolve on the current machine.
@@ -117,6 +140,23 @@ fn new_metal(ordinal: usize) -> candle_core::Result<Device> {
     }
 }
 
+/// Check that burn's ROCm device works. candle itself runs on the CPU.
+fn new_rocm(ordinal: usize) -> candle_core::Result<Device> {
+    #[cfg(feature = "rocm")]
+    {
+        crate::burn_device::rocm_device(ordinal).map_err(candle_core::Error::Msg)?;
+        info!("ROCm device {} initialized (burn); candle runs on the CPU", ordinal);
+        Ok(Device::Cpu)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = ordinal;
+        Err(candle_core::Error::Msg(
+            "ROCm feature not enabled at compile time".to_string(),
+        ))
+    }
+}
+
 /// Auto-select the best device based on compiled features and availability.
 fn auto_select() -> candle_core::Result<Device> {
     // Try CUDA first
@@ -143,6 +183,20 @@ fn auto_select() -> candle_core::Result<Device> {
             }
             Err(e) => {
                 info!("Metal not available: {}, falling back", e);
+            }
+        }
+    }
+
+    // Try ROCm, which runs on burn while candle stays on the CPU
+    #[cfg(feature = "rocm")]
+    {
+        match new_rocm(0) {
+            Ok(device) => {
+                info!("Auto-selected ROCm device 0");
+                return Ok(device);
+            }
+            Err(e) => {
+                info!("ROCm not available: {}, falling back", e);
             }
         }
     }
@@ -189,5 +243,6 @@ mod tests {
         assert_eq!(DeviceSelection::Cpu.label(), "cpu");
         assert_eq!(DeviceSelection::Cuda(0).label(), "cuda:0");
         assert_eq!(DeviceSelection::Metal(0).label(), "metal:0");
+        assert_eq!(DeviceSelection::Rocm(0).label(), "rocm:0");
     }
 }

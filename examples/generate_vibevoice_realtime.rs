@@ -122,6 +122,7 @@ fn device_label(device: DeviceSelection) -> &'static str {
         DeviceSelection::Cpu => "cpu",
         DeviceSelection::Metal(_) => "metal",
         DeviceSelection::Cuda(_) => "cuda",
+        DeviceSelection::Rocm(_) => "rocm",
     }
 }
 

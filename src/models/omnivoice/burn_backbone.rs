@@ -7,10 +7,9 @@
 //! with fused kernels: pre-norm, grouped-query attention with a per-head RMSNorm
 //! on Q and K and split-half RoPE, and a SiLU MLP. Weights run in F32.
 
-use burn::tensor::activation::silu;
-use burn::tensor::module::{attention, linear};
-use burn::tensor::ops::AttentionModuleOptions;
-use burn::tensor::{Device, Tensor, TensorData};
+use burn::tensor::activation::{silu, softmax};
+use burn::tensor::module::linear;
+use burn::tensor::{Bool, Device, Tensor, TensorData};
 use candle_core::DType;
 use candle_nn::VarBuilder;
 
@@ -189,15 +188,7 @@ impl Layer {
         let q = rope(rms_norm(q, &self.q_norm, eps), cos, sin).swap_dims(1, 2);
         let k = rope(rms_norm(k, &self.k_norm, eps), cos, sin).swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
-        // Q head i uses KV head i / group, as repeat_interleave does.
-        let group = heads / kv_heads;
-        let repeat = |t: Tensor<4>| {
-            t.unsqueeze_dim::<5>(2)
-                .expand([batch, kv_heads, group, seq, head_dim])
-                .reshape([batch, heads, seq, head_dim])
-        };
-        let options = AttentionModuleOptions { scale: None, softcap: None, is_causal: causal };
-        let a = attention(q, repeat(k), repeat(v), None, None, options)
+        let a = attention(q, k, v, heads / kv_heads, causal)
             .swap_dims(1, 2)
             .reshape([batch, seq, heads * head_dim]);
         let x = x + linear(a, self.o.clone(), None);
@@ -207,6 +198,42 @@ impl Layer {
         let up = linear(h, self.up.clone(), None);
         x + linear(gate * up, self.down.clone(), None)
     }
+}
+
+/// Grouped-query attention, written out as softmax(Q Kᵀ / √d) V instead of
+/// calling burn's `attention`.
+///
+/// q is (batch, heads, seq, head_dim); k and v are (batch, kv_heads, seq,
+/// head_dim), and query head i uses KV head i / group, as repeat_interleave
+/// does. The query heads that share a KV head are stacked along the rows, so K
+/// and V are never copied per head.
+///
+/// burn's `attention` is avoided on purpose: when burn's `autotune` feature is
+/// on (parakeet-rs turns it on), it only lets its materialising fallback
+/// compete for sequences no longer than the head dimension, and on GPUs without
+/// matrix cores (RDNA2) the flash kernel it picks instead is about 10 times
+/// slower at OmniVoice's lengths (7.9 ms against 0.8 ms per layer at 512
+/// tokens). This is what that fallback computes. See audio-berry's
+/// docs/amd-gpu.md.
+fn attention(q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, group: usize, causal: bool) -> Tensor<4> {
+    let [batch, heads, seq, head_dim] = q.dims();
+    let kv_heads = heads / group;
+    let q = q.reshape([batch, kv_heads, group * seq, head_dim]);
+    let scores = q.matmul(k.swap_dims(2, 3)).mul_scalar(1.0 / (head_dim as f64).sqrt());
+    let scores = if causal {
+        // True where key position > query position (burn's tril_mask marks
+        // what lies outside the lower triangle). Row r of the stacked rows is
+        // query position r % seq.
+        let device = scores.device();
+        let future = Tensor::<2, Bool>::tril_mask([seq, seq], 0, &device)
+            .unsqueeze_dim::<3>(0)
+            .expand([group, seq, seq])
+            .reshape([1, 1, group * seq, seq]);
+        scores.mask_fill(future, f32::NEG_INFINITY)
+    } else {
+        scores
+    };
+    softmax(scores, 3).matmul(v).reshape([batch, heads, seq, head_dim])
 }
 
 /// RMSNorm over the last dimension, with a weight of that size.
@@ -228,4 +255,44 @@ fn rope(x: Tensor<4>, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<4> {
     let r1 = x1.clone() * cos.clone() - x2.clone() * sin.clone();
     let r2 = x2 * cos + x1 * sin;
     Tensor::cat(vec![r1, r2], 3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::ops::AttentionModuleOptions;
+
+    /// The written-out attention against burn's own, with grouped KV heads,
+    /// with and without the causal mask. Needs a ROCm GPU; skipped without one.
+    #[test]
+    fn attention_matches_burns() {
+        let Ok(device) = crate::burn_device::rocm_device(0) else {
+            eprintln!("no ROCm device; skipping");
+            return;
+        };
+        let (batch, heads, kv_heads, seq, dim) = (2, 4, 2, 37, 16);
+        let values = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n).map(|i| (((i + seed) * 2654435761) % 1000) as f32 / 250.0 - 2.0).collect()
+        };
+        let tensor = |shape: [usize; 4], seed: usize| {
+            let n = shape.iter().product();
+            Tensor::<4>::from_data(TensorData::new(values(n, seed), shape), &device)
+        };
+        let q = tensor([batch, heads, seq, dim], 1);
+        let k = tensor([batch, kv_heads, seq, dim], 2);
+        let v = tensor([batch, kv_heads, seq, dim], 3);
+        let group = heads / kv_heads;
+        let repeat = |t: Tensor<4>| {
+            t.unsqueeze_dim::<5>(2).expand([batch, kv_heads, group, seq, dim]).reshape([batch, heads, seq, dim])
+        };
+        for causal in [false, true] {
+            let options = AttentionModuleOptions { scale: None, softcap: None, is_causal: causal };
+            let want = burn::tensor::module::attention(q.clone(), repeat(k.clone()), repeat(v.clone()), None, None, options);
+            let got = attention(q.clone(), k.clone(), v.clone(), group, causal);
+            let want: Vec<f32> = want.into_data().to_vec().unwrap();
+            let got: Vec<f32> = got.into_data().to_vec().unwrap();
+            let diff = want.iter().zip(&got).fold(0.0f32, |d, (a, b)| d.max((a - b).abs()));
+            assert!(diff < 1e-5, "causal {causal}: max |diff| {diff}");
+        }
+    }
 }

@@ -7,7 +7,7 @@
 //! with fused kernels: pre-norm, grouped-query attention with a per-head RMSNorm
 //! on Q and K and split-half RoPE, and a SiLU MLP. Weights run in F32.
 
-use burn::tensor::activation::{silu, softmax};
+use burn::tensor::activation::{log_softmax, silu};
 use burn::tensor::module::linear;
 use burn::tensor::{Bool, Device, Tensor, TensorData};
 use candle_core::DType;
@@ -140,20 +140,10 @@ impl BurnBackbone {
         causal: bool,
     ) -> Result<candle_core::Tensor, TtsError> {
         let started = std::time::Instant::now();
-        let (batch, seq, width) = hidden.dims3()?;
-        let values = hidden.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let prepared = started.elapsed();
+        let (batch, seq, _) = hidden.dims3()?;
+        let input = self.upload(hidden)?;
         let run = || -> Result<(Vec<f32>, usize), String> {
-            let x = Tensor::<3>::from_data(TensorData::new(values, [batch, seq, width]), &self.device);
-            let cos = self.rope_cos.clone().narrow(0, 0, seq);
-            let sin = self.rope_sin.clone().narrow(0, 0, seq);
-            let x = self
-                .layers
-                .iter()
-                .fold(x, |x, layer| layer.forward(x, &cos, &sin, self.shape, causal));
-            let x = x.narrow(1, seq - logits_len, logits_len);
-            let x = rms_norm(x, &self.norm, self.shape.eps);
-            let logits = linear(x, self.head.clone(), None);
+            let logits = self.logits(input, logits_len, causal);
             let [_, _, size] = logits.dims();
             let values = logits.into_data().try_to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
             Ok((values, size))
@@ -163,8 +153,7 @@ impl BurnBackbone {
             .map_err(TtsError::RuntimeError)?;
         if std::env::var_os("OMNIVOICE_TIMINGS").is_some() {
             eprintln!(
-                "omnivoice timing: burn backbone batch {batch} seq {seq} logits {logits_len}: host {:.3}s, total {:.3}s",
-                prepared.as_secs_f64(),
+                "omnivoice timing: burn backbone batch {batch} seq {seq} logits {logits_len}: total {:.3}s",
                 started.elapsed().as_secs_f64()
             );
         }
@@ -173,6 +162,88 @@ impl BurnBackbone {
             (batch, logits_len, size),
             &candle_core::Device::Cpu,
         )?)
+    }
+
+    /// One generation step's greedy picks, without bringing the logits back to
+    /// the CPU: runs the conditional pass (and the unconditional one, for
+    /// classifier-free guidance at `scale`), takes log-softmax over each
+    /// codebook's vocabulary, combines them as
+    /// log_softmax(c + scale (c - u)), adds `penalty` (one value per vocabulary
+    /// entry), and returns each (codebook, position)'s best token and its
+    /// log-probability, codebook-major, for the last `logits_len` positions.
+    /// Each pass is (hidden, causal); hidden is (1, seq, hidden) F32 on the CPU.
+    pub(super) fn predict(
+        &self,
+        cond: (&candle_core::Tensor, bool),
+        uncond: Option<(&candle_core::Tensor, bool)>,
+        logits_len: usize,
+        codebooks: usize,
+        scale: f64,
+        penalty: &[f32],
+    ) -> Result<(Vec<u32>, Vec<f32>), TtsError> {
+        let started = std::time::Instant::now();
+        let vocab = penalty.len();
+        let cond_input = self.upload(cond.0)?;
+        let uncond_input = uncond.map(|(hidden, causal)| self.upload(hidden).map(|t| (t, causal))).transpose()?;
+        let penalty = penalty.to_vec();
+        let run = || -> Result<(Vec<u32>, Vec<f32>), String> {
+            let log_probs = |logits: Tensor<3>| {
+                log_softmax(logits.reshape([logits_len, codebooks, vocab]).swap_dims(0, 1), 2)
+            };
+            let c = log_probs(self.logits(cond_input, logits_len, cond.1));
+            let guided = match uncond_input {
+                Some((input, causal)) => {
+                    let u = log_probs(self.logits(input, logits_len, causal));
+                    log_softmax(c.clone() + (c - u).mul_scalar(scale), 2)
+                }
+                None => c,
+            };
+            let penalty = Tensor::<1>::from_data(TensorData::new(penalty, [vocab]), &self.device);
+            let guided = guided + penalty.reshape([1, 1, vocab]);
+            let tokens = guided.clone().argmax(2).into_data();
+            let scores = guided.max_dim(2).into_data();
+            let tokens = tokens.iter::<i64>().map(|t| t as u32).collect();
+            let scores = scores.try_to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            Ok((tokens, scores))
+        };
+        let picks = guard("running OmniVoice's backbone on the GPU", run)
+            .and_then(|result| result)
+            .map_err(TtsError::RuntimeError)?;
+        if std::env::var_os("OMNIVOICE_TIMINGS").is_some() {
+            eprintln!(
+                "omnivoice timing: burn step seq {}{} logits {logits_len}: total {:.3}s",
+                cond.0.dim(1)?,
+                uncond.map(|(h, _)| h.dim(1).map(|s| format!(" + {s}")).unwrap_or_default()).unwrap_or_default(),
+                started.elapsed().as_secs_f64()
+            );
+        }
+        Ok(picks)
+    }
+
+    /// Copies hidden states, (batch, seq, hidden) on the CPU, to the GPU.
+    fn upload(&self, hidden: &candle_core::Tensor) -> Result<Tensor<3>, TtsError> {
+        let (batch, seq, width) = hidden.dims3()?;
+        let values = hidden.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        guard("copying hidden states to the GPU", || {
+            Tensor::<3>::from_data(TensorData::new(values, [batch, seq, width]), &self.device)
+        })
+        .map_err(TtsError::RuntimeError)
+    }
+
+    /// The layers, the final norm and the audio head: logits (batch,
+    /// logits_len, codebooks * audio_vocab) for the last `logits_len`
+    /// positions, left on the GPU.
+    fn logits(&self, x: Tensor<3>, logits_len: usize, causal: bool) -> Tensor<3> {
+        let [_, seq, _] = x.dims();
+        let cos = self.rope_cos.clone().narrow(0, 0, seq);
+        let sin = self.rope_sin.clone().narrow(0, 0, seq);
+        let x = self
+            .layers
+            .iter()
+            .fold(x, |x, layer| layer.forward(x, &cos, &sin, self.shape, causal));
+        let x = x.narrow(1, seq - logits_len, logits_len);
+        let x = rms_norm(x, &self.norm, self.shape.eps);
+        linear(x, self.head.clone(), None)
     }
 }
 
@@ -218,22 +289,56 @@ impl Layer {
 fn attention(q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, group: usize, causal: bool) -> Tensor<4> {
     let [batch, heads, seq, head_dim] = q.dims();
     let kv_heads = heads / group;
-    let q = q.reshape([batch, kv_heads, group * seq, head_dim]);
-    let scores = q.matmul(k.swap_dims(2, 3)).mul_scalar(1.0 / (head_dim as f64).sqrt());
+    let device = q.device();
+    // Scaling Q rather than the scores saves a pass over the (seq x seq) scores.
+    let q = q
+        .mul_scalar(1.0 / (head_dim as f64).sqrt())
+        .reshape([batch, kv_heads, group * seq, head_dim]);
+    // The keys are padded to a multiple of 8 so the score rows vectorise (at
+    // 981 keys every softmax kernel ran element by element). The padding
+    // repeats the last key, so it can't raise a row's max, and its rows of V
+    // (below) are zero, so it adds nothing.
+    let keys = seq.div_ceil(8) * 8;
+    let pad = keys - seq;
+    let k = if pad == 0 {
+        k
+    } else {
+        let last = k.clone().narrow(2, seq - 1, 1).expand([batch, kv_heads, pad, head_dim]);
+        Tensor::cat(vec![k, last], 2)
+    };
+    // V with a column of ones (and three zeros, to keep rows a multiple of
+    // 4): P V then also gives each row's sum of P, the softmax denominator,
+    // instead of a separate reduction and a divide over the scores.
+    let v = Tensor::cat(
+        vec![
+            v,
+            Tensor::ones([batch, kv_heads, seq, 1], &device),
+            Tensor::zeros([batch, kv_heads, seq, 3], &device),
+        ],
+        3,
+    );
+    let v = if pad == 0 {
+        v
+    } else {
+        Tensor::cat(vec![v, Tensor::zeros([batch, kv_heads, pad, head_dim + 4], &device)], 2)
+    };
+    let scores = q.matmul(k.swap_dims(2, 3));
     let scores = if causal {
         // True where key position > query position (burn's tril_mask marks
         // what lies outside the lower triangle). Row r of the stacked rows is
         // query position r % seq.
-        let device = scores.device();
-        let future = Tensor::<2, Bool>::tril_mask([seq, seq], 0, &device)
+        let future = Tensor::<2, Bool>::tril_mask([seq, keys], 0, &device)
             .unsqueeze_dim::<3>(0)
-            .expand([group, seq, seq])
-            .reshape([1, 1, group * seq, seq]);
+            .expand([group, seq, keys])
+            .reshape([1, 1, group * seq, keys]);
         scores.mask_fill(future, f32::NEG_INFINITY)
     } else {
         scores
     };
-    softmax(scores, 3).matmul(v).reshape([batch, heads, seq, head_dim])
+    let max = scores.clone().max_dim(3);
+    let weighted = (scores - max).exp().matmul(v);
+    let out = weighted.clone().narrow(3, 0, head_dim) / weighted.narrow(3, head_dim, 1);
+    out.reshape([batch, heads, seq, head_dim])
 }
 
 /// RMSNorm over the last dimension, with a weight of that size.
@@ -270,29 +375,31 @@ mod tests {
             eprintln!("no ROCm device; skipping");
             return;
         };
-        let (batch, heads, kv_heads, seq, dim) = (2, 4, 2, 37, 16);
-        let values = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| (((i + seed) * 2654435761) % 1000) as f32 / 250.0 - 2.0).collect()
-        };
-        let tensor = |shape: [usize; 4], seed: usize| {
-            let n = shape.iter().product();
-            Tensor::<4>::from_data(TensorData::new(values(n, seed), shape), &device)
-        };
-        let q = tensor([batch, heads, seq, dim], 1);
-        let k = tensor([batch, kv_heads, seq, dim], 2);
-        let v = tensor([batch, kv_heads, seq, dim], 3);
-        let group = heads / kv_heads;
-        let repeat = |t: Tensor<4>| {
-            t.unsqueeze_dim::<5>(2).expand([batch, kv_heads, group, seq, dim]).reshape([batch, heads, seq, dim])
-        };
-        for causal in [false, true] {
-            let options = AttentionModuleOptions { scale: None, softcap: None, is_causal: causal };
-            let want = burn::tensor::module::attention(q.clone(), repeat(k.clone()), repeat(v.clone()), None, None, options);
-            let got = attention(q.clone(), k.clone(), v.clone(), group, causal);
-            let want: Vec<f32> = want.into_data().try_to_vec::<f32>().unwrap();
-            let got: Vec<f32> = got.into_data().try_to_vec::<f32>().unwrap();
-            let diff = want.iter().zip(&got).fold(0.0f32, |d, (a, b)| d.max((a - b).abs()));
-            assert!(diff < 1e-5, "causal {causal}: max |diff| {diff}");
+        for seq in [37, 40] {
+            let (batch, heads, kv_heads, dim) = (2, 4, 2, 16);
+            let values = |n: usize, seed: usize| -> Vec<f32> {
+                (0..n).map(|i| (((i + seed) * 2654435761) % 1000) as f32 / 250.0 - 2.0).collect()
+            };
+            let tensor = |shape: [usize; 4], seed: usize| {
+                let n = shape.iter().product();
+                Tensor::<4>::from_data(TensorData::new(values(n, seed), shape), &device)
+            };
+            let q = tensor([batch, heads, seq, dim], 1);
+            let k = tensor([batch, kv_heads, seq, dim], 2);
+            let v = tensor([batch, kv_heads, seq, dim], 3);
+            let group = heads / kv_heads;
+            let repeat = |t: Tensor<4>| {
+                t.unsqueeze_dim::<5>(2).expand([batch, kv_heads, group, seq, dim]).reshape([batch, heads, seq, dim])
+            };
+            for causal in [false, true] {
+                let options = AttentionModuleOptions { scale: None, softcap: None, is_causal: causal };
+                let want = burn::tensor::module::attention(q.clone(), repeat(k.clone()), repeat(v.clone()), None, None, options);
+                let got = attention(q.clone(), k.clone(), v.clone(), group, causal);
+                let want: Vec<f32> = want.into_data().try_to_vec::<f32>().unwrap();
+                let got: Vec<f32> = got.into_data().try_to_vec::<f32>().unwrap();
+                let diff = want.iter().zip(&got).fold(0.0f32, |d, (a, b)| d.max((a - b).abs()));
+                assert!(diff < 1e-5, "seq {seq} causal {causal}: max |diff| {diff}");
+            }
         }
     }
 }

@@ -297,6 +297,7 @@ impl OmniVoiceBackbone {
         &self,
         cond: (&Tensor, &[u32], Option<&Tensor>),
         uncond: Option<(&[u32], Option<&Tensor>)>,
+        logits_len: usize,
     ) -> Option<Result<GpuPasses, TtsError>> {
         let burn = self.burn.as_ref()?;
         let run = || {
@@ -308,10 +309,10 @@ impl OmniVoiceBackbone {
                 .to_dtype(text_embeds.dtype())?;
             let text = text_embeds.broadcast_mul(&text_mask)?;
             Ok(GpuPasses {
-                cond: burn.prepare_pass(Some(&text), audio_mask, attention_mask.is_some())?,
+                cond: burn.prepare_pass(Some(&text), audio_mask, attention_mask.is_some(), logits_len)?,
                 uncond: uncond
                     .map(|(audio_mask, attention_mask)| {
-                        burn.prepare_pass(None, audio_mask, attention_mask.is_some())
+                        burn.prepare_pass(None, audio_mask, attention_mask.is_some(), logits_len)
                     })
                     .transpose()?,
             })
@@ -889,6 +890,7 @@ impl OmniVoiceModel {
                     (&cond_ids, &cond_audio_mask_u32_values, cond_attention_mask.as_ref()),
                     (gen_config.guidance_scale != 0.0)
                         .then_some((uncond_audio_mask.as_slice(), uncond_attention_mask.as_ref())),
+                    target_len,
                 )
                 .transpose()?;
             BACKBONE_NANOS.fetch_add(

@@ -71,6 +71,10 @@ struct Block {
     units: [ResidualUnit; 3],
 }
 
+/// Frame counts are padded to a multiple of this (about 1.3 s); see
+/// [`BurnAudioDecoder::decode`].
+const FRAME_BUCKET: usize = 32;
+
 impl BurnAudioDecoder {
     /// Copies the decoder's weights from `vb`, the audio tokenizer's F32
     /// VarBuilder on the CPU, to `device`.
@@ -214,10 +218,28 @@ impl BurnAudioDecoder {
                 codes.len()
             )));
         }
-        let codes: Vec<i64> = codes.iter().map(|&c| i64::from(c)).collect();
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        // Padded to a multiple of FRAME_BUCKET frames, then cut back: burn
+        // tunes its matmuls for each new shape, and every chunk has a different
+        // length. The padding is zeroed before every convolution that looks
+        // past a sample (see `zero_past`), which is what the convolutions'
+        // own zero padding gives the unpadded input, so the result is the same.
+        let padded = len.div_ceil(FRAME_BUCKET) * FRAME_BUCKET;
+        let codes: Vec<i64> = codes
+            .chunks_exact(len)
+            .flat_map(|row| {
+                let last = row[len - 1];
+                row.iter()
+                    .copied()
+                    .chain(std::iter::repeat_n(last, padded - len))
+                    .map(i64::from)
+            })
+            .collect();
         let run = || -> Result<Vec<f32>, String> {
             let codes = Tensor::<2, Int>::from_data(
-                TensorData::new(codes, [num_quantizers, len]),
+                TensorData::new(codes, [num_quantizers, padded]),
                 &self.device,
             );
             // Sum over quantizers of project_out(codebook[code]), (1, len, hidden).
@@ -233,19 +255,26 @@ impl BurnAudioDecoder {
             }
             let summed = summed.ok_or("OmniVoice's audio decoder has no quantizers")?;
             let x = linear(summed, self.fc2.0.clone(), Some(self.fc2.1.clone())).swap_dims(1, 2);
-            let mut x = self.conv(&self.conv_in, x);
+            // Each upsampling multiplies the valid length by its stride.
+            let mut valid = len;
+            let mut x = self.conv(&self.conv_in, zero_past(x, valid));
             for block in &self.blocks {
-                x = self.conv_transpose(&block.upsample, block.snake.forward(x));
+                x = self.conv_transpose(&block.upsample, zero_past(block.snake.forward(x), valid));
+                valid *= block.upsample.stride;
                 for unit in &block.units {
-                    let h = self.conv(&unit.conv1, unit.snake1.forward(x.clone()));
+                    let h = self.conv(
+                        &unit.conv1,
+                        zero_past(unit.snake1.forward(x.clone()), valid),
+                    );
                     let h = self.conv(&unit.conv2, unit.snake2.forward(h));
                     x = x + h;
                 }
             }
             let x = self
-                .conv(&self.conv_out, self.snake_out.forward(x))
+                .conv(&self.conv_out, zero_past(self.snake_out.forward(x), valid))
                 .clamp(-1.0, 1.0);
-            x.into_data()
+            x.narrow(2, 0, valid)
+                .into_data()
                 .try_to_vec::<f32>()
                 .map_err(|e| format!("{e:?}"))
         };
@@ -277,6 +306,17 @@ impl BurnAudioDecoder {
             conv_transpose1d(x, conv)
         }
     }
+}
+
+/// `x`, (batch, channels, len), with every position from `valid` on set to
+/// zero.
+fn zero_past(x: Tensor<3>, valid: usize) -> Tensor<3> {
+    let [batch, channels, len] = x.dims();
+    if valid >= len {
+        return x;
+    }
+    let zeros = Tensor::<3>::zeros([batch, channels, len - valid], &x.device());
+    Tensor::cat(vec![x.narrow(2, 0, valid), zeros], 2)
 }
 
 impl Snake {

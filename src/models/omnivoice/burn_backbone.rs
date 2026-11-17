@@ -100,22 +100,28 @@ impl BurnBackbone {
                 .to_vec1::<f32>()?;
             Ok(Tensor::<2>::from_data(TensorData::new(values, [out, inp]), &device).transpose())
         };
+        // The layers' projections, optionally in F16; see [`project`].
+        let half = std::env::var_os("OMNIVOICE_BURN_F16").is_some();
+        let projection = |vb: &VarBuilder, name: &str, out: usize, inp: usize| -> Result<Tensor<2>, TtsError> {
+            let weight = matrix(vb, name, out, inp)?;
+            Ok(if half { weight.transpose().cast(burn::tensor::DType::F16).transpose() } else { weight })
+        };
         let load = || -> Result<Self, TtsError> {
             let mut layers = Vec::with_capacity(llm.num_hidden_layers);
             for index in 0..llm.num_hidden_layers {
                 let vb = vb.pp(format!("llm.layers.{index}"));
                 layers.push(Layer {
                     input_norm: vector(&vb, "input_layernorm", hidden)?,
-                    q: matrix(&vb, "self_attn.q_proj", q_size, hidden)?,
-                    k: matrix(&vb, "self_attn.k_proj", kv_size, hidden)?,
-                    v: matrix(&vb, "self_attn.v_proj", kv_size, hidden)?,
-                    o: matrix(&vb, "self_attn.o_proj", hidden, q_size)?,
+                    q: projection(&vb, "self_attn.q_proj", q_size, hidden)?,
+                    k: projection(&vb, "self_attn.k_proj", kv_size, hidden)?,
+                    v: projection(&vb, "self_attn.v_proj", kv_size, hidden)?,
+                    o: projection(&vb, "self_attn.o_proj", hidden, q_size)?,
                     q_norm: vector(&vb, "self_attn.q_norm", shape.head_dim)?,
                     k_norm: vector(&vb, "self_attn.k_norm", shape.head_dim)?,
                     post_norm: vector(&vb, "post_attention_layernorm", hidden)?,
-                    gate: matrix(&vb, "mlp.gate_proj", llm.intermediate_size, hidden)?,
-                    up: matrix(&vb, "mlp.up_proj", llm.intermediate_size, hidden)?,
-                    down: matrix(&vb, "mlp.down_proj", hidden, llm.intermediate_size)?,
+                    gate: projection(&vb, "mlp.gate_proj", llm.intermediate_size, hidden)?,
+                    up: projection(&vb, "mlp.up_proj", llm.intermediate_size, hidden)?,
+                    down: projection(&vb, "mlp.down_proj", hidden, llm.intermediate_size)?,
                 });
             }
             let norm = vector(vb, "llm.norm", hidden)?;
@@ -326,21 +332,21 @@ impl Layer {
         let Shape { heads, kv_heads, head_dim, eps } = shape;
         let h = rms_norm(x.clone(), &self.input_norm, eps);
 
-        let q = linear(h.clone(), self.q.clone(), None).reshape([batch, seq, heads, head_dim]);
-        let k = linear(h.clone(), self.k.clone(), None).reshape([batch, seq, kv_heads, head_dim]);
-        let v = linear(h, self.v.clone(), None).reshape([batch, seq, kv_heads, head_dim]);
+        let q = project(h.clone(), &self.q).reshape([batch, seq, heads, head_dim]);
+        let k = project(h.clone(), &self.k).reshape([batch, seq, kv_heads, head_dim]);
+        let v = project(h, &self.v).reshape([batch, seq, kv_heads, head_dim]);
         let q = rope(rms_norm(q, &self.q_norm, eps), cos, sin).swap_dims(1, 2);
         let k = rope(rms_norm(k, &self.k_norm, eps), cos, sin).swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
         let a = attention(q, k, v, heads / kv_heads, causal)
             .swap_dims(1, 2)
             .reshape([batch, seq, heads * head_dim]);
-        let x = x + linear(a, self.o.clone(), None);
+        let x = x + project(a, &self.o);
 
         let h = rms_norm(x.clone(), &self.post_norm, eps);
-        let gate = silu(linear(h.clone(), self.gate.clone(), None));
-        let up = linear(h, self.up.clone(), None);
-        x + linear(gate * up, self.down.clone(), None)
+        let gate = silu(project(h.clone(), &self.gate));
+        let up = project(h, &self.up);
+        x + project(gate * up, &self.down)
     }
 }
 
@@ -414,6 +420,17 @@ fn attention(q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, group: usize, causal: boo
     out.reshape([batch, heads, seq, head_dim])
 }
 
+/// x W, with W (in, out). With F16 weights (`OMNIVOICE_BURN_F16`), x is cast
+/// to F16 for the matmul and the result back to F32; norms, attention and the
+/// residual stream stay F32.
+fn project(x: Tensor<3>, weight: &Tensor<2>) -> Tensor<3> {
+    if weight.dtype() == burn::tensor::DType::F16 {
+        linear(x.cast(burn::tensor::DType::F16), weight.clone(), None).cast(burn::tensor::DType::F32)
+    } else {
+        linear(x, weight.clone(), None)
+    }
+}
+
 /// RMSNorm over the last dimension, with a weight of that size.
 fn rms_norm<const D: usize>(x: Tensor<D>, weight: &Tensor<1>, eps: f64) -> Tensor<D> {
     let mut shape = [1usize; D];
@@ -465,8 +482,8 @@ mod tests {
                 t.unsqueeze_dim::<5>(2).expand([batch, kv_heads, group, seq, dim]).reshape([batch, heads, seq, dim])
             };
             for causal in [false, true] {
-                let options = AttentionModuleOptions { scale: None, softcap: None, is_causal: causal };
-                let want = burn::tensor::module::attention(q.clone(), repeat(k.clone()), repeat(v.clone()), None, None, options);
+                let options = AttentionModuleOptions { is_causal: causal, ..Default::default() };
+                let want = burn::tensor::module::attention(q.clone(), repeat(k.clone()), repeat(v.clone()), None, None, None, options);
                 let got = attention(q.clone(), k.clone(), v.clone(), group, causal);
                 let want: Vec<f32> = want.into_data().try_to_vec::<f32>().unwrap();
                 let got: Vec<f32> = got.into_data().try_to_vec::<f32>().unwrap();

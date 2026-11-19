@@ -51,6 +51,8 @@
 pub mod audio;
 #[cfg(feature = "rocm")]
 pub mod burn_device;
+#[cfg(feature = "rocm")]
+pub mod hipblas;
 pub mod config;
 pub mod device;
 pub mod error;

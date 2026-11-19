@@ -11,13 +11,13 @@
 //! on Q and K and split-half RoPE, and a SiLU MLP. Weights run in F32.
 
 use burn::tensor::activation::{log_softmax, silu};
-use burn::tensor::module::linear;
 use burn::tensor::{Bool, Device, Int, Tensor, TensorData};
 use candle_core::DType;
 use candle_nn::VarBuilder;
 
 use super::config::OmniVoiceLlmConfig;
 use crate::burn_device::guard;
+use crate::hipblas::matmul;
 use crate::error::TtsError;
 use crate::tensor_utils::precompute_rope_half_freqs;
 
@@ -399,7 +399,7 @@ impl BurnBackbone {
                 })
                 .collect();
             let x = rms_norm(Tensor::cat(windows, 1), &self.norm, self.shape.eps);
-            let logits = linear(x, self.head.clone(), None);
+            let logits = project(x, &self.head);
             let log_probs = |index: usize| {
                 let logits = logits.clone().narrow(1, index * window, window);
                 log_softmax(
@@ -471,7 +471,7 @@ impl BurnBackbone {
         );
         let x = x.narrow(1, seq - logits_len, logits_len);
         let x = rms_norm(x, &self.norm, self.shape.eps);
-        linear(x, self.head.clone(), None)
+        project(x, &self.head)
     }
 }
 
@@ -636,7 +636,7 @@ fn attention(
             2,
         )
     };
-    let scores = q.matmul(k.swap_dims(2, 3));
+    let scores = matmul(q, k.swap_dims(2, 3));
     let scores = if causal {
         // True where key position > query position (burn's tril_mask marks
         // what lies outside the lower triangle). Row r of the stacked rows is
@@ -650,20 +650,21 @@ fn attention(
         scores
     };
     let max = scores.clone().max_dim(3);
-    let weighted = (scores - max).exp().matmul(v);
+    let weighted = matmul((scores - max).exp(), v);
     let out = weighted.clone().narrow(3, 0, head_dim) / weighted.narrow(3, head_dim, 1);
     out.reshape([batch, heads, seq, head_dim])
 }
 
 /// x W, with W (in, out). With F16 weights (`OMNIVOICE_BURN_F16`), x is cast
 /// to F16 for the matmul and the result back to F32; norms, attention and the
-/// residual stream stay F32.
+/// residual stream stay F32. Through hipBLAS where it's available (see
+/// [`crate::hipblas`]), as are attention's matmuls.
 fn project(x: Tensor<3>, weight: &Tensor<2>) -> Tensor<3> {
+    let weight = weight.clone().unsqueeze::<3>();
     if weight.dtype() == burn::tensor::DType::F16 {
-        linear(x.cast(burn::tensor::DType::F16), weight.clone(), None)
-            .cast(burn::tensor::DType::F32)
+        matmul(x.cast(burn::tensor::DType::F16), weight).cast(burn::tensor::DType::F32)
     } else {
-        linear(x, weight.clone(), None)
+        matmul(x, weight)
     }
 }
 

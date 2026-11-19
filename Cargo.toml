@@ -129,9 +129,10 @@ anyhow = "1"
 # any-tts needs its own copies. gemm 0.19 panics on CPUs with FMA but no AVX2;
 # pliron 0.19 (under burn) can resolve to a hashbrown too old to build with;
 # cubecl-hip-sys has no bindings for Ubuntu 26.04's HIP (52801).
+# cubecl-hip hands out its HIP stream (for hipBLAS on the same stream).
 [patch.crates-io]
 gemm-common = { git = "https://github.com/tommymcc/gemm", rev = "dbdcb05011089a25f1b4d34e89eee4504b61f605" }
 gemm-f16 = { git = "https://github.com/tommymcc/gemm", rev = "dbdcb05011089a25f1b4d34e89eee4504b61f605" }
 pliron = { git = "https://github.com/tommymcc/pliron", rev = "ac2cc0c820907013df7d955be7da370a7b8b2c2f" }
 cubecl-hip-sys = { git = "https://github.com/tommymcc/cubecl-hip-sys", rev = "26e8dea1b9ae2a362f28ed2aadf67f25d2022acb" }
-cubecl-hip = { path = "../forks/cubecl-hip-0.12" }
+cubecl-hip = { git = "https://github.com/tommymcc/cubecl", rev = "a940e2272f3ca545c421f46ba17388fb64fed297" }
